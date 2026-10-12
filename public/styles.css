@@ -132,6 +132,10 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .subtitle.speakable:hover { background: rgba(127, 127, 127, 0.12); border-radius: 8px; }
 
 /* Source line shown while its translation is in flight. */
+.subtitle.draft {
+  opacity: 0.7; /* live draft: will be replaced by the final translation */
+}
+
 .subtitle.pending {
   opacity: 0.45;
   font-weight: 500;

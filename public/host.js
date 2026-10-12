@@ -151,6 +151,7 @@ function handleServerMessage(msg) {
       setStatus('capture-status', msg.status.toUpperCase(), msg.status === 'running' ? 'live' : 'idle');
       break;
     case 'source':
+      if (msg.final === false) break; // draft of an open utterance: host already sees the interim line
       if (msg.interim) {
         showInterimLine(msg.text); // one live line, not 100 log entries
       } else {
@@ -164,7 +165,7 @@ function handleServerMessage(msg) {
       break;
     }
     case 'translation': {
-      if (msg.language) {
+      if (msg.language && msg.final !== false) {
         // Host sees all languages with a small tag.
         appendLog('translation-log', `[${msg.language}] ${msg.text}`, false, msg.language);
       }
@@ -273,26 +274,37 @@ async function startCapture() {
 //   - when a result becomes final, its remaining tail is committed.
 // ------------------------------------------------------------------
 
-function createLiveCommitter(send, lang) {
+function createLiveCommitter(send, lang, onUtteranceEnd = () => {}) {
   const charMode = /^(ja|zh|th)/i.test(lang || '');
   const tokenize = (t) => (charMode ? Array.from(t.replace(/\s+/g, '')) : t.trim().split(/\s+/).filter(Boolean));
   const join = (toks) => (charMode ? toks.join('') : toks.join(' '));
   const MARGIN = charMode ? 2 : 1;
   const MIN_TOKENS = charMode ? 6 : 3;
   const TICK_MS = 800;
-  const IDLE_MS = 1000;
+  // Silence that counts as the end of an utterance. Longer = fewer mid-sentence
+  // cuts (better translations) but slower finals; drafts keep captions live.
+  const IDLE_MS = 1200;
 
   const sent = new Map(); // result index -> tokens already committed
   const live = new Map(); // result index -> latest tokens of an interim result
   let tickTimer = null;
   let idleTimer = null;
+  let dirty = false;
 
   function commit(i, tokens, upto) {
     const from = sent.get(i) || 0;
     if (upto <= from) return;
     sent.set(i, upto);
     const text = join(tokens.slice(from, upto));
-    if (text) send(text);
+    if (text) { send(text); dirty = true; }
+  }
+
+  // Tell the server the speaker paused / the result ended, so it can produce
+  // the final translation of everything sent since the last boundary.
+  function endUtterance() {
+    if (!dirty) return;
+    dirty = false;
+    onUtteranceEnd();
   }
 
   function flushLive(all) {
@@ -314,6 +326,7 @@ function createLiveCommitter(send, lang) {
       if (isFinal) {
         commit(i, tokens, tokens.length);
         live.delete(i);
+        endUtterance(); // Chrome finalizes a result after a pause
         return;
       }
       live.set(i, tokens);
@@ -321,13 +334,14 @@ function createLiveCommitter(send, lang) {
         tickTimer = setTimeout(() => { tickTimer = null; flushLive(false); }, TICK_MS);
       }
       if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => { idleTimer = null; flushLive(true); }, IDLE_MS);
+      idleTimer = setTimeout(() => { idleTimer = null; flushLive(true); endUtterance(); }, IDLE_MS);
     },
     /** Commit everything still pending (recognizer ended / capture stopped). */
     flushAll() {
       clearTimers();
       flushLive(true);
       live.clear();
+      endUtterance();
     },
     dispose() {
       clearTimers();
@@ -368,7 +382,11 @@ function startRecognition() {
   recognition.continuous = true;
   recognition.interimResults = true;
 
-  const committer = createLiveCommitter((text) => sendWs({ type: 'final_text', text }), recognition.lang);
+  const committer = createLiveCommitter(
+    (text) => sendWs({ type: 'final_text', text }),
+    recognition.lang,
+    () => sendWs({ type: 'utterance_end' }),
+  );
   state.committer = committer;
 
   // Did the very first attempt produce anything at all?

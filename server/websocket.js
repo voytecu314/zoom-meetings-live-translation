@@ -342,6 +342,13 @@ export function setupWebSocket(server, httpServer) {
         break;
       }
 
+      case 'utterance_end': {
+        // Host detected a pause in speech: close the open utterance now so its
+        // final, full-context translation is produced without waiting.
+        flushSession(session, { translate: true }, (id, obj) => safeBroadcast(id, obj));
+        break;
+      }
+
       case 'set_languages': {
         const source = typeof msg.source === 'string' ? msg.source.slice(0, 12) : null;
         const targets = Array.isArray(msg.targets)

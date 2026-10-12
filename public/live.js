@@ -128,12 +128,20 @@ function handle(msg) {
       render();
       break;
 
-    case 'translation':
+    case 'translation': {
+      // final === false: live DRAFT of a still-growing utterance. It replaces
+      // the same caption line in place and is never read aloud.
+      const isFinal = msg.final !== false;
+      if (!isFinal && state.sourceLines.get(msg.sequence)?.done) break; // stale draft
       rememberTranslation(msg.sequence, msg.language, msg.text);
+      const line = state.sourceLines.get(msg.sequence);
+      line.draft = !isFinal;
+      if (isFinal) line.done = true;
       render();
-      // Only speak the language the viewer is actually reading.
-      if (msg.language === languageInUse()) enqueueSpeech(msg.sequence);
+      // Only speak finals, and only the language the viewer is actually reading.
+      if (isFinal && msg.language === languageInUse()) enqueueSpeech(msg.sequence);
       break;
+    }
 
     case 'session_stopped':
       stopped = true;
@@ -216,10 +224,11 @@ function render() {
     }
     anyShown = true;
     const div = document.createElement('div');
-    div.className = 'subtitle' + (pending ? ' pending' : '');
+    const isDraft = !pending && entry.draft === true;
+    div.className = 'subtitle' + (pending ? ' pending' : '') + (isDraft ? ' draft' : '');
     div.dataset.sequence = String(seq);
     div.textContent = text; // XSS-safe
-    if (!pending) {
+    if (!pending && !isDraft) {
       div.title = 'Click to hear this line';
       div.classList.add('speakable');
     }

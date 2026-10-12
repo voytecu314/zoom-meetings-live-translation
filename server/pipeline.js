@@ -12,6 +12,7 @@ import {
   completeTranslation,
   nextSequence,
   recordTranslation,
+  updateSource,
 } from './sessions.js';
 
 /** session -> { segmenter } */
@@ -41,23 +42,26 @@ export function baseLocale(lang) {
 }
 
 // ------------------------------------------------------------------
-// LIVE STREAMING INGESTION
+// LIVE INGESTION: utterances, drafts and final translations
 // ------------------------------------------------------------------
-// Browser speech recognition (Chrome) rarely emits punctuation, so waiting
-// for a sentence terminator means nothing is translated until the host stops
-// capturing. Instead the host streams small, NON-overlapping text deltas and
-// the server decides when a chunk is worth translating:
+// Browser speech recognition (Chrome) emits no punctuation, so there is no
+// reliable sentence boundary in the text. Cutting by word count (the old
+// behaviour) splits sentences in arbitrary places and ruins translation
+// quality. Instead:
 //
-//   1. complete sentences (terminal punctuation) are emitted immediately;
-//   2. a buffered remainder is emitted as soon as it reaches
-//      streamMinWords words (clause-sized chunk), or contains a clause
-//      boundary and at least streamMinWords/2 words;
-//   3. otherwise the remainder is emitted after pauseThresholdMs without new
-//      text (speaker paused) — so latency is bounded even for short phrases.
+//   * The unit of translation is an UTTERANCE: speech up to a pause (or up to
+//     real terminal punctuation when the engine does provide it).
+//   * While an utterance is still open, its WHOLE text so far is re-translated
+//     (throttled) as a DRAFT: { final: false }. Viewers replace the same
+//     caption line in place, so captions stay live and every draft is a
+//     translation of a complete prefix, never of a detached fragment.
+//   * When the utterance ends (host pause signal "utterance_end", fallback
+//     timer, punctuation, or the max-length valve) ONE final, full-context
+//     translation is sent: { final: true }. Only finals are read aloud and
+//     stored in catch-up history.
 //
-// Trade-off (documented): chunks that end mid-sentence are translated without
-// the rest of the sentence, which is slightly less accurate than full-sentence
-// translation but is what makes the captions genuinely live.
+// Trade-off: extra translation requests for drafts (DRAFT_TRANSLATIONS=false
+// disables them; captions then appear once per utterance).
 
 function countUnits(text) {
   const t = text.trim();
@@ -67,11 +71,18 @@ function countUnits(text) {
   return words > 1 ? words : Math.ceil(t.length / 2);
 }
 
-function emitSentence(session, text, broadcast) {
-  const entry = nextSequence(session, text);
-  broadcast(session.id, { type: 'source', sessionId: session.id, sequence: entry.sequence, text: entry.text });
-  dispatchTranslations(session, entry.sequence, entry.text, broadcast);
-  return entry;
+/** Per-session state of the utterance that is currently open. */
+function utt(session) {
+  if (!session._utt) session._utt = { seq: null, text: '', langs: new Map() };
+  return session._utt;
+}
+
+function resetUtterance(session) {
+  const u = utt(session);
+  for (const d of u.langs.values()) if (d.timer) clearTimeout(d.timer);
+  u.seq = null;
+  u.text = '';
+  u.langs = new Map(); // also invalidates in-flight draft results
 }
 
 function clearIdleTimer(session) {
@@ -81,9 +92,86 @@ function clearIdleTimer(session) {
   }
 }
 
+/** Announce / update the still-open utterance and schedule draft translations. */
+function openOrUpdateDraft(session, text, broadcast) {
+  const u = utt(session);
+  if (u.seq == null) {
+    u.seq = nextSequence(session, text).sequence;
+  } else {
+    updateSource(session, u.seq, text);
+  }
+  u.text = text;
+  broadcast(session.id, { type: 'source', sessionId: session.id, sequence: u.seq, text, final: false });
+  scheduleDrafts(session, broadcast);
+}
+
+/** Close the open utterance (or start+close a new one) with its final text. */
+function finalizeUtterance(session, text, broadcast) {
+  const u = utt(session);
+  let sequence;
+  if (u.seq != null) {
+    sequence = u.seq;
+    updateSource(session, sequence, text);
+  } else {
+    sequence = nextSequence(session, text).sequence;
+  }
+  resetUtterance(session);
+  broadcast(session.id, { type: 'source', sessionId: session.id, sequence, text, final: true });
+  dispatchTranslations(session, sequence, text, broadcast);
+  return { sequence, text };
+}
+
+function scheduleDrafts(session, broadcast) {
+  const { draftTranslations, draftIntervalMs, draftMinWords, draftMinNewWords } = config.segmentation;
+  if (!draftTranslations) return;
+  const u = utt(session);
+  const units = countUnits(u.text);
+  if (u.seq == null || units < draftMinWords) return;
+  for (const lang of session.targetLanguages) {
+    let d = u.langs.get(lang);
+    if (!d) {
+      d = { inflight: false, timer: null, lastAt: 0, lastUnits: 0 };
+      u.langs.set(lang, d);
+    }
+    if (d.inflight || d.timer) continue; // it will pick up the latest text
+    if (d.lastUnits && units - d.lastUnits < draftMinNewWords) continue;
+    const wait = Math.max(0, d.lastAt + draftIntervalMs - Date.now());
+    d.timer = setTimeout(() => {
+      d.timer = null;
+      void runDraft(session, lang, d, broadcast);
+    }, wait);
+    d.timer.unref?.();
+  }
+}
+
+async function runDraft(session, lang, d, broadcast) {
+  const u = utt(session);
+  if (session.closed || u.seq == null || u.langs.get(lang) !== d) return;
+  const sequence = u.seq;
+  const text = u.text;
+  d.inflight = true;
+  d.lastAt = Date.now();
+  d.lastUnits = countUnits(text);
+  let result = null;
+  try {
+    result = await translateText(text, session.sourceLanguage, lang);
+  } catch (err) {
+    log(`session ${session.id} seq ${sequence} draft CRASHED (${lang}): ${err?.message ?? err}`);
+  }
+  d.inflight = false;
+  // Utterance finalized (or session closed) while we were waiting: drop it.
+  if (session.closed || u.seq !== sequence || u.langs.get(lang) !== d) return;
+  if (result?.ok) {
+    broadcast(session.id, {
+      type: 'translation', sessionId: session.id, sequence, language: lang, text: result.text, final: false,
+    });
+  }
+  scheduleDrafts(session, broadcast); // text may have grown meanwhile
+}
+
 /**
- * Ingest committed recognition text for a session (a delta, not a rolling
- * hypothesis). Returns the source messages that were emitted right away.
+ * Ingest committed recognition text (a delta, not a rolling hypothesis).
+ * Returns the utterances that were finalized by this call.
  *
  * @param {object} session
  * @param {string} text         newly committed text
@@ -91,42 +179,49 @@ function clearIdleTimer(session) {
  */
 export function ingestFinalText(session, text, broadcast) {
   const segmenter = getSegmenterFor(session);
-  const { streamMinWords, pauseThresholdMs } = config.segmentation;
-  const emitted = [];
+  const { maxUtteranceWords, pauseThresholdMs } = config.segmentation;
+  const finalized = [];
 
   clearIdleTimer(session);
 
-  for (const sentence of segmenter.feed(text, { dedupe: false })) {
-    emitted.push(emitSentence(session, sentence, broadcast));
+  // Real sentence punctuation (when the engine provides any) closes sentences.
+  // The first one also closes the open utterance: it contains the buffered text.
+  // Host deltas carry no leading space; keep words apart (not for ja/zh/th).
+  const needsSpace = segmenter.bufferedText() && !/^\s/.test(text) && !/^(ja|zh|th)/i.test(session.sourceLanguage || '');
+  for (const sentence of segmenter.feed((needsSpace ? ' ' : '') + text, { dedupe: false })) {
+    finalized.push(finalizeUtterance(session, sentence, broadcast));
   }
 
   const rest = segmenter.bufferedText().trim();
-  if (rest) {
-    const units = countUnits(rest);
-    const hasClause = /[,;:、،]/u.test(rest);
-    if (units >= streamMinWords || (hasClause && units >= Math.ceil(streamMinWords / 2))) {
-      const tail = segmenter.flush(true, { dedupe: false });
-      if (tail) emitted.push(emitSentence(session, tail, broadcast));
-    } else {
-      // Speaker paused? Emit whatever is buffered after the idle threshold.
-      session._idleTimer = setTimeout(() => {
-        session._idleTimer = null;
-        if (session.closed) return;
-        const tail = segmenter.flush(true, { dedupe: false });
-        if (tail) emitSentence(session, tail, broadcast);
-      }, pauseThresholdMs);
-      session._idleTimer.unref?.();
-    }
+  if (!rest) return finalized;
+
+  if (countUnits(rest) >= maxUtteranceWords) {
+    const tail = segmenter.flush(true, { dedupe: false });
+    if (tail) finalized.push(finalizeUtterance(session, tail, broadcast));
+    return finalized;
   }
-  return emitted;
+
+  openOrUpdateDraft(session, rest, broadcast);
+
+  // Fallback end-of-utterance in case the host's pause signal never arrives.
+  session._idleTimer = setTimeout(() => {
+    session._idleTimer = null;
+    if (!session.closed) flushSession(session, { translate: true }, broadcast);
+  }, pauseThresholdMs);
+  session._idleTimer.unref?.();
+  return finalized;
 }
 
-/** Flush leftover buffer when capture stops. */
+/**
+ * End the open utterance now (speaker paused / capture stopped) and send its
+ * final translation. With translate:false the leftover is discarded.
+ */
 export function flushSession(session, { translate = true } = {}, broadcast) {
   clearIdleTimer(session);
   const segmenter = getSegmenterFor(session);
   const tail = segmenter.flush(translate, { dedupe: false });
-  if (tail) return emitSentence(session, tail, broadcast);
+  if (tail) return finalizeUtterance(session, tail, broadcast);
+  resetUtterance(session);
   return null;
 }
 
@@ -152,6 +247,7 @@ function dispatchTranslations(session, sequence, text, broadcast) {
           sequence,
           language: lang,
           text: result.text,
+          final: true,
         });
       } catch (err) {
         completeTranslation(session, sequence, lang);
@@ -188,6 +284,8 @@ export function configureSessionSegmentation(session, { sourceLanguage, maxBuffe
   if (sourceLanguage && sourceLanguage !== session.sourceLanguage) {
     session.sourceLanguage = sourceLanguage;
     segmenters.delete(session.id);
+    clearIdleTimer(session);
+    resetUtterance(session);
     getSegmenterFor(session); // recreate with new locale
   }
   if (typeof maxBufferChars === 'number') {

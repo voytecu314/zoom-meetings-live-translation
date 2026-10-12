@@ -60,12 +60,19 @@ export const config = {
     // If a buffered fragment exceeds this many chars without terminal
     // punctuation, flush it at the last clause boundary. 0 disables.
     maxBufferChars: int(process.env.MAX_BUFFER_CHARS, 0),
-    // LIVE streaming: buffered text that has not reached a sentence end is
-    // translated after this many ms without new text (speaker paused).
-    pauseThresholdMs: Math.max(200, int(process.env.PAUSE_THRESHOLD_MS, 1200)),
-    // LIVE streaming: translate a buffered chunk as soon as it holds this
-    // many words (half of it when it ends at a clause boundary).
-    streamMinWords: Math.max(2, int(process.env.STREAM_MIN_WORDS, 8)),
+    // An utterance (what gets translated as ONE unit) ends at terminal
+    // punctuation, at a speaker pause signalled by the host, or - as a
+    // fallback if that signal is lost - after this many ms without new text.
+    pauseThresholdMs: Math.max(200, int(process.env.PAUSE_THRESHOLD_MS, 1800)),
+    // Safety valve: an utterance this long (words; ~2 chars each for ja/zh/th)
+    // is finalized even without a pause, to bound latency.
+    maxUtteranceWords: Math.max(8, int(process.env.MAX_UTTERANCE_WORDS, 40)),
+    // Live DRAFT translations of the still-open utterance (replaced in place
+    // on the viewer, never spoken). Costs extra translation requests.
+    draftTranslations: (process.env.DRAFT_TRANSLATIONS ?? 'true') !== 'false',
+    draftIntervalMs: Math.max(250, int(process.env.DRAFT_INTERVAL_MS, 1000)),
+    draftMinWords: Math.max(1, int(process.env.DRAFT_MIN_WORDS, 3)),
+    draftMinNewWords: Math.max(1, int(process.env.DRAFT_MIN_NEW_WORDS, 2)),
   },
 
   // WebSocket guards

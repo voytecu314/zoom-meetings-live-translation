@@ -114,6 +114,22 @@ export function nextSequence(session, text) {
   return entry;
 }
 
+/**
+ * Update the text of an already-announced source line (the utterance is still
+ * growing, or is being finalized). Keeps catch-up history consistent.
+ */
+export function updateSource(session, sequence, text) {
+  for (let i = session.history.length - 1; i >= 0; i--) {
+    const h = session.history[i];
+    if (h.type === 'source' && h.sequence === sequence) {
+      h.text = text;
+      break;
+    }
+  }
+  session.lastSpeechAt = Date.now();
+  session.lastActive = Date.now();
+}
+
 /** Append a translation to history (order = append order; clients sort by sequence). */
 export function recordTranslation(session, sequence, language, text) {
   const entry = { type: 'translation', sequence, language, text };

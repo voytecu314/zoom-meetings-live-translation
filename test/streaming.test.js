@@ -44,22 +44,81 @@ const open = (path) => new Promise((resolve, reject) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const translations = (ws) => ws.messages.filter((m) => m.type === 'translation');
 
-test('unpunctuated speech is translated while capture is still running', async () => {
+test('unpunctuated speech: drafts while talking, ONE final translation of the whole utterance', async () => {
+  config.segmentation.draftIntervalMs = 250;
+  const prevPause = config.segmentation.pauseThresholdMs;
+  config.segmentation.pauseThresholdMs = 5000; // only the host's utterance_end may close it here
   const s = createSession({ sourceLanguage: 'en-US', targetLanguages: ['de'] });
   const viewer = await open(`/ws/live?session=${s.id}`);
   const host = await open(`/ws/host?session=${s.id}&token=${s.hostToken}`);
 
-  // No punctuation, never sends stop_capture.
+  try {
+  // Deltas of ONE sentence, no punctuation, no stop_capture.
   host.send(JSON.stringify({ type: 'start_capture' }));
-  host.send(JSON.stringify({ type: 'final_text', text: 'so today we are going to talk about the new roadmap' }));
-  await sleep(250);
-  assert.ok(translations(viewer).length >= 1, 'long clause streams immediately');
+  host.send(JSON.stringify({ type: 'final_text', text: 'so today we are going to talk' }));
+  await sleep(500);
+  host.send(JSON.stringify({ type: 'final_text', text: 'about the new roadmap for next year' }));
+  await sleep(500);
 
-  // A short phrase must not wait for stop either: idle flush kicks in.
+  const drafts = translations(viewer).filter((t) => t.final === false);
+  assert.ok(drafts.length >= 1, 'live drafts arrive while the speaker is still talking');
+  assert.equal(new Set(translations(viewer).map((t) => t.sequence)).size, 1, 'one caption line, updated in place');
+  assert.equal(translations(viewer).filter((t) => t.final === true).length, 0, 'no final before the pause');
+
+  // Pause signal from the host -> single final of the COMPLETE sentence.
+  host.send(JSON.stringify({ type: 'utterance_end' }));
+  await sleep(300);
+  const finals = translations(viewer).filter((t) => t.final === true);
+  assert.equal(finals.length, 1);
+  assert.match(finals[0].text, /so today we are going to talk about the new roadmap for next year/);
+  assert.equal(finals[0].sequence, drafts[0].sequence, 'final replaces the draft line');
+
+  const sources = viewer.messages.filter((m) => m.type === 'source' && !m.interim);
+  assert.equal(new Set(sources.map((m) => m.sequence)).size, 1);
+  assert.equal(sources.at(-1).final, true);
+  } finally {
+    config.segmentation.pauseThresholdMs = prevPause;
+    host.close(); viewer.close();
+  }
+});
+
+test('pause fallback timer finalizes when utterance_end is lost', async () => {
+  const s = createSession({ sourceLanguage: 'en-US', targetLanguages: ['de'] });
+  const viewer = await open(`/ws/live?session=${s.id}`);
+  const host = await open(`/ws/host?session=${s.id}&token=${s.hostToken}`);
   host.send(JSON.stringify({ type: 'final_text', text: 'any questions' }));
-  await sleep(700);
-  const all = translations(viewer).map((t) => t.text).join(' | ');
-  assert.match(all, /any questions/);
+  await sleep(700); // pauseThresholdMs = 300 in tests
+  const finals = translations(viewer).filter((t) => t.final === true);
+  assert.equal(finals.length, 1);
+  assert.match(finals[0].text, /any questions/);
+  host.close(); viewer.close();
+});
+
+test('punctuation, when present, closes sentences; the unfinished rest stays open', async () => {
+  const s = createSession({ sourceLanguage: 'en-US', targetLanguages: ['de'] });
+  const viewer = await open(`/ws/live?session=${s.id}`);
+  const host = await open(`/ws/host?session=${s.id}&token=${s.hostToken}`);
+  host.send(JSON.stringify({ type: 'final_text', text: 'First sentence here. And then the second' }));
+  await sleep(100);
+  const finals = translations(viewer).filter((t) => t.final === true);
+  assert.equal(finals.length, 1);
+  assert.match(finals[0].text, /First sentence here\./);
+  host.send(JSON.stringify({ type: 'utterance_end' }));
+  await sleep(250);
+  assert.match(translations(viewer).filter((t) => t.final === true).map((t) => t.text).join(' '), /And then the second/);
+  host.close(); viewer.close();
+});
+
+test('long speech without a pause is cut by the max-length valve', async () => {
+  const prev = config.segmentation.maxUtteranceWords;
+  config.segmentation.maxUtteranceWords = 10;
+  const s = createSession({ sourceLanguage: 'en-US', targetLanguages: ['de'] });
+  const viewer = await open(`/ws/live?session=${s.id}`);
+  const host = await open(`/ws/host?session=${s.id}&token=${s.hostToken}`);
+  host.send(JSON.stringify({ type: 'final_text', text: 'one two three four five six seven eight nine ten eleven twelve' }));
+  await sleep(250);
+  assert.ok(translations(viewer).some((t) => t.final === true));
+  config.segmentation.maxUtteranceWords = prev;
   host.close(); viewer.close();
 });
 

@@ -49,8 +49,10 @@ Copy `.env.example` to `.env` and edit. All settings have working defaults
 | `PORT` | HTTP+WS port (default 3000) |
 | `PUBLIC_BASE_URL` | Optional. Base for viewer links, e.g. `https://sub.example.com`. If unset, derived from the host's request |
 | `TRUST_PROXY` | `true` (default): use `X-Forwarded-For` for per-IP limits behind a proxy/tunnel |
-| `STREAM_MIN_WORDS` | Words buffered before a not-yet-finished sentence is translated live (default 8) |
-| `PAUSE_THRESHOLD_MS` | Pause length (ms) after which buffered speech is translated (default 1200) |
+| `PAUSE_THRESHOLD_MS` | Fallback end-of-utterance: ms without new text before the final translation (default 1800). The host normally signals the pause itself (~1.2 s of silence) |
+| `MAX_UTTERANCE_WORDS` | An utterance this long is finalized even without a pause (default 40) |
+| `DRAFT_TRANSLATIONS` | `true` (default): re-translate the growing utterance live (drafts replaced in place, never spoken). `false`: one translation per utterance |
+| `DRAFT_INTERVAL_MS` / `DRAFT_MIN_WORDS` / `DRAFT_MIN_NEW_WORDS` | Draft throttling: min ms between drafts per language (1000), min words before the first draft (3), min new words between drafts (2) |
 | `TRANSLATION_PROVIDER` | `mock` (dev, free, offline) or `google-x` |
 | `TRANSLATION_CONCURRENCY` | Max parallel translation requests (default 4) |
 | `TRANSLATION_TIMEOUT_MS` | Per-request timeout (default 8000) |
@@ -59,6 +61,22 @@ Copy `.env.example` to `.env` and edit. All settings have working defaults
 | `MAX_BUFFER_CHARS` | Flush buffer at clause boundary after N chars (0 = off) |
 | `WS_ALLOWED_ORIGINS` | Comma-separated origins for WebSocket validation (set this in production!) |
 | `TRANSCRIPTION_PROVIDER` | `none` (default) or `generic-http` — server-side fallback |
+
+## How text is chunked for translation
+
+Chrome's speech recognition returns text **without punctuation**, so sentence
+boundaries cannot be found in the text. Translation is therefore done per
+*utterance* (speech up to a pause), never per fixed number of words:
+
+1. While the speaker talks, the whole utterance so far is re-translated
+   (throttled) as a **draft**; viewers replace the same caption line in place
+   (shown slightly dimmed).
+2. On a pause (host sends `utterance_end` after ~1.2 s of silence or when
+   Chrome finalizes a result; server timer as fallback), one **final**
+   translation of the complete utterance replaces the draft.
+3. Only finals are read aloud and stored in the catch-up history.
+
+If the recognizer does emit sentence punctuation, it also ends utterances.
 
 ## Testing without Zoom (mock mode)
 
