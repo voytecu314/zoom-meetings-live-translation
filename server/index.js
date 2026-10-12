@@ -16,6 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 app.disable('x-powered-by');
+if (config.env.trustProxy) app.set('trust proxy', true); // req.ip / req.protocol from X-Forwarded-*
 app.use(express.json({ limit: '32kb' }));
 
 // Minimal security headers.
@@ -29,12 +30,15 @@ app.use((_req, res, next) => {
 // Very basic in-memory rate limiting for the API (per IP, per minute).
 const apiHits = new Map();
 app.use('/api', (req, res, next) => {
-  const ip = req.socket.remoteAddress || '?';
+  const ip = req.ip || req.socket.remoteAddress || '?';
   const now = Date.now();
   const windowMs = 60000;
   const hits = apiHits.get(ip)?.filter((t) => now - t < windowMs) ?? [];
   hits.push(now);
   apiHits.set(ip, hits);
+  if (apiHits.size > 5000) {
+    for (const [k, v] of apiHits) if (!v.some((t) => now - t < windowMs)) apiHits.delete(k);
+  }
   const limit = 60;
   if (hits.length > limit) {
     return res.status(429).json({ error: 'rate limit exceeded' });
@@ -82,7 +86,13 @@ app.post('/api/sessions', (req, res) => {
     sourceLanguage: sourceLanguage || 'en',
     targetLanguages: Array.isArray(targetLanguages) ? targetLanguages : ['en'],
   });
-  const viewerUrl = `${config.env.publicBaseUrl}/live/${session.id}`;
+  // Prefer an explicitly configured public URL; otherwise use the address the
+  // host is actually browsing from (a hard-coded http://localhost:3000 link is
+  // useless to anyone but the host).
+  const base = config.env.publicBaseUrlExplicit
+    ? config.env.publicBaseUrl
+    : `${req.protocol}://${req.get('host')}`;
+  const viewerUrl = `${base}/live/${session.id}`;
   console.log(`[http] session created ${session.id}`);
   res.status(201).json({
     sessionId: session.id,

@@ -6,6 +6,7 @@
 
 import { createSegmenter, ABBREVIATION_PACKS } from './sentence-segmenter.js';
 import { translateText } from './translation/index.js';
+import { config } from './config.js';
 import {
   claimTranslation,
   completeTranslation,
@@ -39,47 +40,93 @@ export function baseLocale(lang) {
   return (lang || 'en').split('-')[0];
 }
 
+// ------------------------------------------------------------------
+// LIVE STREAMING INGESTION
+// ------------------------------------------------------------------
+// Browser speech recognition (Chrome) rarely emits punctuation, so waiting
+// for a sentence terminator means nothing is translated until the host stops
+// capturing. Instead the host streams small, NON-overlapping text deltas and
+// the server decides when a chunk is worth translating:
+//
+//   1. complete sentences (terminal punctuation) are emitted immediately;
+//   2. a buffered remainder is emitted as soon as it reaches
+//      streamMinWords words (clause-sized chunk), or contains a clause
+//      boundary and at least streamMinWords/2 words;
+//   3. otherwise the remainder is emitted after pauseThresholdMs without new
+//      text (speaker paused) — so latency is bounded even for short phrases.
+//
+// Trade-off (documented): chunks that end mid-sentence are translated without
+// the rest of the sentence, which is slightly less accurate than full-sentence
+// translation but is what makes the captions genuinely live.
+
+function countUnits(text) {
+  const t = text.trim();
+  if (!t) return 0;
+  const words = t.split(/\s+/).length;
+  // Scripts without spaces (ja/zh/th): approximate a "word" as ~2 characters.
+  return words > 1 ? words : Math.ceil(t.length / 2);
+}
+
+function emitSentence(session, text, broadcast) {
+  const entry = nextSequence(session, text);
+  broadcast(session.id, { type: 'source', sessionId: session.id, sequence: entry.sequence, text: entry.text });
+  dispatchTranslations(session, entry.sequence, entry.text, broadcast);
+  return entry;
+}
+
+function clearIdleTimer(session) {
+  if (session._idleTimer) {
+    clearTimeout(session._idleTimer);
+    session._idleTimer = null;
+  }
+}
+
 /**
- * Ingest finalized recognition text for a session.
- * Returns emitted source messages [{sequence, text}] so the caller can
- * broadcast them; translation jobs are started in the background.
+ * Ingest committed recognition text for a session (a delta, not a rolling
+ * hypothesis). Returns the source messages that were emitted right away.
  *
- * @param {object} session      session object from sessions.js
- * @param {string} finalText    finalized recognition text (may repeat tail)
- * @param {object} broadcast    function(sessionId, payloadObject) to send JSON
+ * @param {object} session
+ * @param {string} text         newly committed text
+ * @param {function} broadcast  function(sessionId, payloadObject)
  */
-export function ingestFinalText(session, finalText, broadcast, { isFragment = null } = {}) {
+export function ingestFinalText(session, text, broadcast) {
   const segmenter = getSegmenterFor(session);
-  // Host sends fast fragment commits (rolling interim tails) — fragment mode
-  // streams clause boundaries live. Sessions can default to fragment mode
-  // (s._fragmentMode) so mock-panel and standalone hosts share the live path.
-  const fragment = isFragment !== null ? isFragment : (session._fragmentMode === true);
-  const sentences = fragment
-    ? segmenter.feed(finalText, { isFragment: true })
-    : segmenter.feed(finalText);
-  const messages = [];
-  for (const sentence of sentences) {
-    const entry = nextSequence(session, sentence);
-    messages.push(entry);
+  const { streamMinWords, pauseThresholdMs } = config.segmentation;
+  const emitted = [];
+
+  clearIdleTimer(session);
+
+  for (const sentence of segmenter.feed(text, { dedupe: false })) {
+    emitted.push(emitSentence(session, sentence, broadcast));
   }
-  // Broadcast source lines immediately (this is what viewers see first).
-  for (const msg of messages) {
-    broadcast(session.id, { type: 'source', sessionId: session.id, sequence: msg.sequence, text: msg.text });
-    dispatchTranslations(session, msg.sequence, msg.text, broadcast);
+
+  const rest = segmenter.bufferedText().trim();
+  if (rest) {
+    const units = countUnits(rest);
+    const hasClause = /[,;:、،]/u.test(rest);
+    if (units >= streamMinWords || (hasClause && units >= Math.ceil(streamMinWords / 2))) {
+      const tail = segmenter.flush(true, { dedupe: false });
+      if (tail) emitted.push(emitSentence(session, tail, broadcast));
+    } else {
+      // Speaker paused? Emit whatever is buffered after the idle threshold.
+      session._idleTimer = setTimeout(() => {
+        session._idleTimer = null;
+        if (session.closed) return;
+        const tail = segmenter.flush(true, { dedupe: false });
+        if (tail) emitSentence(session, tail, broadcast);
+      }, pauseThresholdMs);
+      session._idleTimer.unref?.();
+    }
   }
-  return messages;
+  return emitted;
 }
 
 /** Flush leftover buffer when capture stops. */
 export function flushSession(session, { translate = true } = {}, broadcast) {
+  clearIdleTimer(session);
   const segmenter = getSegmenterFor(session);
-  const tail = segmenter.flush(translate);
-  if (tail) {
-    const entry = nextSequence(session, tail);
-    broadcast(session.id, { type: 'source', sessionId: session.id, sequence: entry.sequence, text: tail });
-    dispatchTranslations(session, entry.sequence, tail, broadcast);
-    return entry;
-  }
+  const tail = segmenter.flush(translate, { dedupe: false });
+  if (tail) return emitSentence(session, tail, broadcast);
   return null;
 }
 
@@ -94,12 +141,7 @@ function dispatchTranslations(session, sequence, text, broadcast) {
         completeTranslation(session, sequence, lang);
         if (!result.ok) {
           log(`session ${session.id} seq ${sequence} FAILED (${lang}): ${result.error}`);
-          broadcast(session.id, {
-            type: 'error',
-            sessionId: session.id,
-            recoverable: true,
-            message: `translation failed (seq ${sequence}, ${lang}): ${result.error}`,
-          });
+          notifyHost(session, `translation failed (seq ${sequence}, ${lang}): ${result.error}`);
           return;
         }
         recordTranslation(session, sequence, lang, result.text);
@@ -114,14 +156,17 @@ function dispatchTranslations(session, sequence, text, broadcast) {
       } catch (err) {
         completeTranslation(session, sequence, lang);
         log(`session ${session.id} seq ${sequence} CRASHED (${lang}): ${err?.message ?? err}`);
-        broadcast(session.id, {
-          type: 'error',
-          sessionId: session.id,
-          recoverable: true,
-          message: `translation crashed (seq ${sequence}, ${lang}): ${err?.message ?? err}`,
-        });
+        notifyHost(session, `translation crashed (seq ${sequence}, ${lang}): ${err?.message ?? err}`);
       }
     })();
+  }
+}
+
+/** Translation problems are an operator concern: tell the host, not viewers. */
+function notifyHost(session, message) {
+  const sock = session.hostSocket;
+  if (sock && sock.readyState === sock.OPEN) {
+    try { sock.send(JSON.stringify({ type: 'error', sessionId: session.id, recoverable: true, message })); } catch {}
   }
 }
 

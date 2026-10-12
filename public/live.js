@@ -18,6 +18,10 @@ const state = {
   spokenUpTo: -1,
   speakingNow: null,   // current utterance bookkeeping
   speechEnabled: false,
+  queuedSeqs: new Set(), // sequences already queued for speech (no duplicates)
+  reconnectDelay: 1000,
+  reconnectTimer: null,
+  closedByServer: false,
 };
 
 const SUBTITLE_LIMIT = 60; // bounded history kept in DOM
@@ -31,26 +35,58 @@ function wsUrl() {
   return `${proto}//${location.host}/ws/live?session=${encodeURIComponent(state.sessionId)}`;
 }
 
+// Close codes sent by the server that mean "do not retry".
+const FATAL_CLOSE_CODES = [4401, 4404];
+
 function connect() {
+  if (stopped || state.closedByServer) return;
+  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
+  clearTimeout(state.reconnectTimer);
   setStatus('CONNECTING', 'connecting');
   const ws = new WebSocket(wsUrl());
   state.ws = ws;
 
-  ws.onopen = () => setStatus('LIVE', 'live');
+  ws.onopen = () => {
+    state.reconnectDelay = 1000;
+    setStatus('LIVE', 'live');
+  };
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     handle(msg);
   };
-  ws.onclose = () => {
-    setStatus('DISCONNECTED', 'disconnected');
-    console.warn('[viewer] ws closed — reconnecting in 2s');
-    setTimeout(() => { if (!stopped && !state.closedByServer) connect(); }, 2000); // reconnect handling
+  ws.onclose = (ev) => {
+    if (state.ws !== ws) return; // an older socket, already replaced
+    if (stopped || state.closedByServer) return;
+    if (FATAL_CLOSE_CODES.includes(ev.code)) {
+      // Session does not exist (ended / server restarted): retrying is pointless.
+      stopped = true;
+      setStatus('SESSION ENDED', 'disconnected');
+      hideControls();
+      return;
+    }
+    setStatus('RECONNECTING…', 'connecting');
+    // Exponential backoff (1s → 10s) so a flaky network or restarting server
+    // is not hammered, while a quick blip still recovers fast.
+    state.reconnectTimer = setTimeout(connect, state.reconnectDelay);
+    state.reconnectDelay = Math.min(state.reconnectDelay * 1.6, 10000);
   };
-  ws.onerror = () => setStatus('DISCONNECTED', 'disconnected');
+  ws.onerror = () => { /* onclose always follows and handles retry */ };
 }
 
 let stopped = false;
+
+// Phones suspend background tabs and drop their sockets silently. Reconnect
+// right away when the tab is visible again or the network comes back.
+function reconnectNow() {
+  if (stopped || state.closedByServer) return;
+  if (!state.ws || state.ws.readyState === WebSocket.CLOSED || state.ws.readyState === WebSocket.CLOSING) {
+    state.reconnectDelay = 1000;
+    connect();
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) reconnectNow(); });
+window.addEventListener('online', reconnectNow);
 
 function applyMessage(h) {
   handle(h);
@@ -63,8 +99,13 @@ function handle(msg) {
       state.sourceLanguage = msg.sourceLanguage || 'en';
       populateLanguageSelect();
       if (Array.isArray(msg.history)) {
+        // Replay catch-up history WITHOUT reading it aloud.
+        const wasSpeaking = state.speechEnabled;
+        state.speechEnabled = false;
         for (const h of msg.history) applyMessage(h);
+        state.speechEnabled = wasSpeaking;
         state.historyLoaded = true;
+        markAllAsSpoken();
       }
       break;
 
@@ -90,7 +131,8 @@ function handle(msg) {
     case 'translation':
       rememberTranslation(msg.sequence, msg.language, msg.text);
       render();
-      enqueueSpeech(msg.sequence);
+      // Only speak the language the viewer is actually reading.
+      if (msg.language === languageInUse()) enqueueSpeech(msg.sequence);
       break;
 
     case 'session_stopped':
@@ -102,7 +144,10 @@ function handle(msg) {
       break;
 
     case 'error':
-      if (msg.recoverable === false) setStatus('DISCONNECTED', 'disconnected');
+      if (msg.recoverable === false) {
+        stopped = true; // server will also close with a fatal code
+        setStatus('SESSION UNAVAILABLE', 'disconnected');
+      }
       console.warn('server error:', msg.message);
       break;
   }
@@ -148,7 +193,9 @@ function render() {
   const seqs = [...state.sourceLines.keys()].sort((a, b) => a - b);
   const lang = languageInUse();
   let anyShown = false;
-  list.textContent = '';  for (const seq of seqs) {
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+  list.textContent = '';
+  for (const seq of seqs) {
     const entry = state.sourceLines.get(seq);
     let text = null;
     let pending = false;
@@ -172,6 +219,10 @@ function render() {
     div.className = 'subtitle' + (pending ? ' pending' : '');
     div.dataset.sequence = String(seq);
     div.textContent = text; // XSS-safe
+    if (!pending) {
+      div.title = 'Click to hear this line';
+      div.classList.add('speakable');
+    }
     list.appendChild(div);
   }
 
@@ -179,7 +230,7 @@ function render() {
   while (list.children.length > SUBTITLE_LIMIT) list.removeChild(list.firstChild);
 
   el('waiting').hidden = anyShown;
-  if (anyShown) list.scrollTop = list.scrollHeight;
+  if (anyShown && nearBottom) list.scrollTop = list.scrollHeight;
 }
 
 function renderInterimSource(text) {
@@ -225,6 +276,16 @@ const LANGUAGE_LABELS = {
 // Optional speech synthesis (browser speechSynthesis)
 // ------------------------------------------------------------------
 
+const MAX_SPEECH_BACKLOG = 3; // if reading falls behind, skip ahead to stay live
+
+function markAllAsSpoken() {
+  // Treat everything we currently have as "already seen": turning speech on
+  // starts from NOW instead of reading the whole backlog.
+  for (const seq of state.sourceLines.keys()) {
+    state.spokenUpTo = Math.max(state.spokenUpTo, seq);
+  }
+}
+
 function enqueueSpeech(sequence) {
   if (!state.speechEnabled) return;
   const lang = languageInUse() || state.targetLanguages[0];
@@ -232,9 +293,33 @@ function enqueueSpeech(sequence) {
   const entry = state.sourceLines.get(sequence);
   const text = entry?.translations.get(lang);
   if (!text) return;
-  if (sequence <= state.spokenUpTo) return; // prevent regression
+  if (sequence <= state.spokenUpTo || state.queuedSeqs.has(sequence)) return;
+  state.queuedSeqs.add(sequence);
   state.speechQueue.push({ sequence, text, lang });
+  // Reading is slower than captions can arrive: drop the oldest queued lines
+  // rather than falling further and further behind the speaker.
+  while (state.speechQueue.length > MAX_SPEECH_BACKLOG) {
+    const dropped = state.speechQueue.shift();
+    state.spokenUpTo = Math.max(state.spokenUpTo, dropped.sequence);
+  }
   processSpeechQueue();
+}
+
+/** On-demand: read one specific line (click on a caption), regardless of the toggle. */
+function speakLineNow(sequence) {
+  if (!('speechSynthesis' in window)) return;
+  const lang = languageInUse() || state.targetLanguages[0];
+  const text = state.sourceLines.get(sequence)?.translations.get(lang);
+  if (!text) return;
+  speechSynthesis.cancel();
+  state.speechQueue.length = 0;
+  state.queuedSeqs.clear();
+  state.speakingNow = null;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = mapToVoiceLocale(lang);
+  const voice = pickVoice(u.lang);
+  if (voice) u.voice = voice;
+  speechSynthesis.speak(u);
 }
 
 function processSpeechQueue() {
@@ -247,15 +332,14 @@ function processSpeechQueue() {
   u.lang = mapToVoiceLocale(next.lang);
   const voice = pickVoice(u.lang);
   if (voice) u.voice = voice;
-  u.onend = () => {
+  const done = () => {
     state.spokenUpTo = Math.max(state.spokenUpTo, next.sequence);
+    state.queuedSeqs.delete(next.sequence);
     state.speakingNow = null;
     processSpeechQueue();
   };
-  u.onerror = () => {
-    state.speakingNow = null;
-    processSpeechQueue();
-  };
+  u.onend = done;
+  u.onerror = done;
   // Text subtitle already rendered — speech must not block it.
   speechSynthesis.speak(u);
 }
@@ -281,6 +365,7 @@ function stopSpeech() {
   if (!('speechSynthesis' in window)) return;
   speechSynthesis.cancel();
   state.speechQueue.length = 0;
+  state.queuedSeqs.clear();
   state.speakingNow = null;
 }
 
@@ -306,7 +391,7 @@ document.addEventListener('DOMContentLoaded', () => {
     state.preferredLanguage = e.target.value;
     localStorage.setItem('preferredLanguage', state.preferredLanguage);
     if (state.speechEnabled) stopSpeech();
-    state.spokenUpTo = -1;
+    markAllAsSpoken();
     render();
   });
 
@@ -326,6 +411,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   el('clear').addEventListener('click', () => {
     state.sourceLines.clear();
+    stopSpeech();
     render();
     el('waiting').hidden = false;
   });
@@ -345,13 +431,17 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     el('pause-speech').hidden = false;
-    // Speak anything already translated but not yet spoken.
-    const lang = languageInUse() || state.targetLanguages[0];
-    const seqs = [...state.sourceLines.keys()].sort((a, b) => a - b);
-    for (const seq of seqs) {
-      if (seq > state.spokenUpTo) enqueueSpeech(seq);
-    }
-    void lang;
+    // Start reading from NOW (new captions); click any caption to hear it.
+    markAllAsSpoken();
+    // Some browsers only load voices lazily; make sure a gesture-initiated
+    // utterance primes the engine so later (non-gesture) speech is allowed.
+    try { speechSynthesis.resume(); } catch {}
+  });
+
+  // Click a finished caption to hear that line (on-demand reading).
+  el('subtitles').addEventListener('click', (e) => {
+    const line = e.target.closest?.('.subtitle.speakable');
+    if (line) speakLineNow(Number(line.dataset.sequence));
   });
 
   // Pause / resume / stop speech controls.

@@ -6,11 +6,13 @@
 // Message protocol (JSON envelopes, one object per frame):
 //   host → server:   { type: 'start_capture' }                       (ack: capture_status)
 //                    { type: 'stop_capture' }
-//                    { type: 'final_text', text }                     recognition results
+//                    { type: 'final_text', text }                     NEW committed text (a delta, never
+//                                                                     the whole rolling hypothesis)
 //                    { type: 'interim_text', text }                   provisional captions only
 //                    { type: 'stop_session' }                         ends session for everyone
 //                    { type: 'set_languages', targets: [...], source? }
-//   server → host:   { type: 'session_created', sessionId, hostToken?, viewerUrl }
+//   server → host:   { type: 'viewers', count }                      viewer join/leave
+//                    { type: 'session_created', sessionId, hostToken?, viewerUrl }
 //                    { type: 'session_joined', sessionId, sourceLanguage, targetLanguages, history }
 //                    { type: 'capture_status', status: 'running'|'stopped', detail? }
 //                    { type: 'source' | 'translation' }               echoes what viewers get
@@ -20,6 +22,10 @@
 //                    { type: 'source' | 'translation' }
 //                    { type: 'error', recoverable, message }
 //                    { type: 'session_stopped' }
+//
+// WebSocket close codes used (clients must NOT auto-reconnect on these):
+//   4401 host authorization failed   4404 session not found/ended
+//   4000 host connection replaced by a newer host connection
 //
 // Security notes:
 // - Session IDs are cryptographically random; the host token is separate and
@@ -34,7 +40,6 @@ import {
   __allSessions,
   removeHost,
   removeViewer,
-  pushHistory,
   setHostSocket,
   getSession,
   closeSession,
@@ -58,11 +63,22 @@ function safeSend(socket, obj) {
   }
 }
 
-// Server-side quiesce promotion: when no interim change arrives for this
-// long and the capture is live, the stable hypothesis is committed and
-// translated. This guarantees LIVE subtitles server-side regardless of
-// host-page JS freshness.
-const SERVER_QUIESCE_MS = 1200;
+const CLOSE_UNAUTHORIZED = 4401;
+const CLOSE_NOT_FOUND = 4404;
+const CLOSE_REPLACED = 4000;
+
+/** Real client address: behind a proxy/tunnel the socket address is the proxy's. */
+function clientIp(req) {
+  if (config.env.trustProxy) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) return String(xff).split(',')[0].trim() || 'unknown';
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function closeWith(socket, code, reason) {
+  try { socket.close(code, reason); } catch { /* already closing */ }
+}
 
 function originOk(origin) {
   if (!origin) return true; // non-browser clients (tests) — fine behind same reverse proxy
@@ -80,46 +96,74 @@ export function setupWebSocket(server, httpServer) {
         log('rejected origin', req.headers.origin);
         return false;
       }
-      const ip = req.socket.remoteAddress || 'unknown';
-      const count = connectionsPerIp.get(ip) || 0;
-      if (count >= config.ws.maxConnectionsPerIp) return false;
+      const count = connectionsPerIp.get(clientIp(req)) || 0;
+      if (count >= config.ws.maxConnectionsPerIp) {
+        log('rejected: too many connections from', clientIp(req));
+        return false;
+      }
       return true;
     },
   });
 
   wss.on('connection', (socket, req) => {
     const url = new URL(req.url, 'http://internal');
-    const ip = req.socket.remoteAddress || 'unknown';
+    const ip = clientIp(req);
+
+    // Count this socket and ALWAYS release it on close. (Previously the
+    // counter was only released by the host/viewer branches, so every
+    // rejected connection leaked a slot; reconnecting viewers then exhausted
+    // the per-IP limit — for everyone behind the same proxy/NAT.)
     connectionsPerIp.set(ip, (connectionsPerIp.get(ip) || 0) + 1);
+    socket.once('close', () => {
+      const n = (connectionsPerIp.get(ip) || 1) - 1;
+      if (n <= 0) connectionsPerIp.delete(ip);
+      else connectionsPerIp.set(ip, n);
+    });
+    socket.on('error', () => { /* 'close' follows; avoid unhandled 'error' crashes */ });
 
     socket.isAlive = true;
     socket.on('pong', () => { socket.isAlive = true; });
 
     const path = url.pathname;
     const sessionId = url.searchParams.get('session');
-    let session = sessionId ? getSession(sessionId) : null;
+    const initial = sessionId ? getSession(sessionId) : null;
 
     if (path === '/ws/host') {
       const token = url.searchParams.get('token');
-      if (!session || !token || token !== session.hostToken || session.hostSocket) {
-        safeSend(socket, { type: 'error', recoverable: false, message: 'host authorization failed' });
-        socket.close();
+      if (!initial || initial.closed) {
+        safeSend(socket, { type: 'error', recoverable: false, message: 'session not found' });
+        closeWith(socket, CLOSE_NOT_FOUND, 'session not found');
         return;
       }
-      setHostSocket(session, socket);
+      if (!token || token !== initial.hostToken) {
+        safeSend(socket, { type: 'error', recoverable: false, message: 'host authorization failed' });
+        closeWith(socket, CLOSE_UNAUTHORIZED, 'unauthorized');
+        return;
+      }
+      const sid = initial.id;
+      // A valid host token always wins: after a network drop the old socket
+      // can linger as half-open for up to a heartbeat interval, and refusing
+      // the reconnect would lock the host out of its own session.
+      const previous = initial.hostSocket;
+      setHostSocket(initial, socket);
+      if (previous && previous !== socket) {
+        safeSend(previous, { type: 'error', recoverable: false, message: 'host connection replaced' });
+        closeWith(previous, CLOSE_REPLACED, 'replaced');
+      }
       safeSend(socket, {
         type: 'session_joined',
-        sessionId: session.id,
-        sourceLanguage: session.sourceLanguage,
-        targetLanguages: session.targetLanguages,
-        history: session.history,
+        sessionId: initial.id,
+        sourceLanguage: initial.sourceLanguage,
+        targetLanguages: initial.targetLanguages,
+        history: initial.history,
       });
-      log(`host attached to session ${session.id}`);
+      safeSend(socket, { type: 'viewers', count: initial.viewers.size });
+      log(`host attached to session ${sid}`);
 
       socket.on('message', (raw) => {
-        session = getSession(session.id);
-        if (!session || session.closed) return;
-        session.lastActive = Date.now();
+        const current = getSession(sid);
+        if (!current || current.closed) return;
+        current.lastActive = Date.now();
         let msg;
         try {
           msg = JSON.parse(raw.toString());
@@ -127,67 +171,68 @@ export function setupWebSocket(server, httpServer) {
           safeSend(socket, { type: 'error', recoverable: true, message: 'invalid JSON' });
           return;
         }
-        handleHostMessage(session, socket, msg);
+        handleHostMessage(current, socket, msg);
       });
 
       socket.on('close', () => {
-        connectionsPerIp.set(ip, Math.max(0, (connectionsPerIp.get(ip) || 1) - 1));
-        if (session) {
-          removeHost(session, socket);
-          log(`host disconnected from ${session.id}; viewers=${session.viewers.size}`);
-          if (session.viewers.size === 0 && !session.closed) {
-            // No one left listening and the host is gone → clean up.
-            disposeSessionResources(session.id);
-            // can't delete from map while iterating in sessions.js — schedule.
-            setTimeout(() => {
-              if (!session.hostSocket && session.viewers.size === 0) {
-                closeSessionById(session.id);
-              }
-            }, config.sessions.viewerGraceSeconds * 1000);
-          }
+        const current = getSession(sid);
+        if (!current) return;
+        removeHost(current, socket);
+        log(`host disconnected from ${sid}; viewers=${current.viewers.size}`);
+        if (current.hostSocket || current.closed) return; // host already reconnected
+        if (current.viewers.size === 0) {
+          disposeSessionResources(sid);
+          setTimeout(() => {
+            const s2 = getSession(sid);
+            if (s2 && !s2.hostSocket && s2.viewers.size === 0) closeSessionById(sid);
+          }, config.sessions.viewerGraceSeconds * 1000).unref?.();
         }
       });
     } else if (path === '/ws/live') {
-      if (!session || session.closed) {
+      if (!initial || initial.closed) {
         safeSend(socket, { type: 'error', recoverable: false, message: 'session not found' });
-        socket.close();
+        closeWith(socket, CLOSE_NOT_FOUND, 'session not found');
         return;
       }
-      addViewer(session, socket);
+      const sid = initial.id;
+      addViewer(initial, socket);
       safeSend(socket, {
         type: 'session_joined',
-        sessionId: session.id,
-        sourceLanguage: session.sourceLanguage,
-        targetLanguages: session.targetLanguages,
-        history: session.history,
+        sessionId: initial.id,
+        sourceLanguage: initial.sourceLanguage,
+        targetLanguages: initial.targetLanguages,
+        history: initial.history,
       });
-      log(`viewer attached to ${session.id}; viewers=${session.viewers.size}`);
+      notifyViewerCount(initial);
+      log(`viewer attached to ${sid}; viewers=${initial.viewers.size}`);
 
       socket.on('message', (raw) => {
-        // Viewers only send control messages: language pick, clear, speaking state.
+        // Viewers only send control messages; they cannot affect the session.
         let msg;
-        try {
-          msg = JSON.parse(raw.toString());
-        } catch {
-          return;
-        }
-        if (msg.type === 'set_language' && typeof msg.language === 'string' &&
-            session.targetLanguages.includes(msg.language)) {
+        try { msg = JSON.parse(raw.toString()); } catch { return; }
+        const current = getSession(sid);
+        if (current && msg.type === 'set_language' && typeof msg.language === 'string' &&
+            current.targetLanguages.includes(msg.language)) {
           socket._preferredLanguage = msg.language.slice(0, 16);
         }
-        // anything else from viewers is ignored — they cannot affect the session
       });
 
       socket.on('close', () => {
-        connectionsPerIp.set(ip, Math.max(0, (connectionsPerIp.get(ip) || 1) - 1));
-        if (session) removeViewer(session, socket);
-        log(`viewer left ${session.id}; viewers=${session?.viewers?.size ?? 0}`);
+        const current = getSession(sid);
+        if (!current) return;
+        removeViewer(current, socket);
+        notifyViewerCount(current);
+        log(`viewer left ${sid}; viewers=${current.viewers.size}`);
       });
     } else {
       safeSend(socket, { type: 'error', recoverable: false, message: 'unknown endpoint' });
-      socket.close();
+      closeWith(socket, CLOSE_NOT_FOUND, 'unknown endpoint');
     }
   });
+
+  function notifyViewerCount(session) {
+    if (session.hostSocket) safeSend(session.hostSocket, { type: 'viewers', count: session.viewers.size });
+  }
 
   // Heartbeats: drop dead connections.
   const heartbeat = setInterval(() => {
@@ -206,7 +251,7 @@ export function setupWebSocket(server, httpServer) {
   const cleanup = setInterval(() => {
     const expired = requireCleanup();
     for (const id of expired) closeSessionById(id);
-  }, Math.max(30, Math.min(300, config.sessions.timeoutSeconds)));
+  }, Math.max(30, Math.min(300, config.sessions.timeoutSeconds)) * 1000);
   wss.on('close', () => clearInterval(cleanup));
 
   function requireCleanup() {
@@ -271,62 +316,29 @@ export function setupWebSocket(server, httpServer) {
       }
 
       case 'interim_text': {
+        // Display-only provisional caption (never translated).
         if (typeof msg.text === 'string' && msg.text.length <= 2000) {
-          const hyp = msg.text.slice(0, 2000);
           safeBroadcast(session.id, {
             type: 'source',
             sessionId: session.id,
             interim: true,
-            text: hyp,
+            text: msg.text,
           });
-          // SERVER-SIDE LIVE COMMIT: browsers with stale host JS (or builds
-          // where the page's own rolling commit doesn't run) rely on this.
-          // If the interim hypothesis stops changing for QUIESCE_MS while the
-          // capture is running, promote it to final text and translate. This
-          // is what guarantees viewers get LIVE subtitles without host action.
-          const now = Date.now();
-          if (hyp !== session._srvInterim) {
-            session._srvInterim = hyp;
-            session._srvInterimAt = now;
-            if (session._srvQuiesce) clearTimeout(session._srvQuiesce);
-            session._srvQuiesce =            setTimeout(() => {
-              const stable = session._srvInterim || '';
-              const committed = session._srvCommitted || '';
-              if (stable && stable.trim() && !session.closed) {
-                // Promote only the NEW tail of a GROWING hypothesis (dedupe:
-                // engines rewrite history; the segmenter receives deltas). If
-                // the hypothesis shrank/rewrote, fall back to the full text —
-                // the segmenter's overlap strip handles the seam.
-                let delta = stable;
-                if (committed && stable.startsWith(committed)) {
-                  delta = stable.slice(committed.length);
-                }
-                delta = delta.trim();
-                if (delta) {
-                  log(`session ${session.id}: promoting interim tail (${delta.length} chars): "${delta.slice(0, 60)}"`);
-                  ingestFinalText(session, delta, safeBroadcast, { isFragment: true });
-                }
-                session._srvCommitted = stable;
-              }
-            }, SERVER_QUIESCE_MS);
-          }
         }
         break;
       }
 
       case 'final_text': {
+        // Committed text. The host sends DELTAS (new words only); the
+        // pipeline streams them out as soon as a sentence/clause is ready.
         const text = typeof msg.text === 'string' ? msg.text : '';
-        if (!text) return;
+        if (!text.trim()) return;
         if (text.length > 5000) {
           safeSend(socket, { type: 'error', recoverable: true, message: 'final_text too long' });
           return;
         }
-        log(`session ${session.id}: host sent final_text (${text.length} chars): "${text.replace(/\s+/g, ' ').slice(0, 80)}"`);
+        log(`session ${session.id}: final_text (${text.length} chars): "${text.replace(/\s+/g, ' ').slice(0, 80)}"`);
         ingestFinalText(session, text, safeBroadcast);
-        // A real engine final (or host rolling commit) covers the promoted
-        // interim — remember it so quiesce doesn't re-promote the same tail.
-        session._srvPromoted = text;
-        if (session._srvQuiesce) { clearTimeout(session._srvQuiesce); session._srvQuiesce = null; }
         break;
       }
 
@@ -337,11 +349,6 @@ export function setupWebSocket(server, httpServer) {
           : null;
         if (source) configureSessionSegmentation(session, { sourceLanguage: source });
         if (targets && targets.length) session.targetLanguages = targets;
-        pushHistory(session, {
-          type: 'source',
-          sequence: session.sequence,
-          text: `__languages:${session.sourceLanguage}>${session.targetLanguages.join(',')}`,
-        });
         safeBroadcast(session.id, {
           type: 'session_updated',
           sessionId: session.id,

@@ -98,16 +98,28 @@ function wsBase() {
   return `${proto}//${location.host}`;
 }
 
+let reconnectDelay = 1000;
+
 function connectHostWs() {
   const ws = new WebSocket(`${wsBase()}/ws/host?session=${encodeURIComponent(state.sessionId)}&token=${encodeURIComponent(state.hostToken)}`);
   state.ws = ws;
   setConn('CONNECTING', 'connecting');
 
-  ws.onopen = () => setConn('LIVE', 'live');
-  ws.onclose = () => {
+  ws.onopen = () => { reconnectDelay = 1000; setConn('LIVE', 'live'); };
+  ws.onclose = (ev) => {
     setConn('DISCONNECTED', 'disconnected');
-    // Auto-reconnect unless the user intentionally ended the session.
-    if (state.sessionId) setTimeout(() => { if (state.sessionId) connectHostWs(); }, 2000);
+    // Auto-reconnect unless the session ended / auth failed / another host
+    // tab took over (4401 / 4404 / 4000) or the user ended it on purpose.
+    if ([4401, 4404, 4000].includes(ev.code)) {
+      showCaptureError(ev.code === 4000
+        ? 'This session is now controlled from another host tab. Close this one.'
+        : 'The session no longer exists on the server (it ended or the server restarted). Create a new session.');
+      return;
+    }
+    if (state.sessionId) {
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
+      setTimeout(() => { if (state.sessionId && state.ws === ws) connectHostWs(); }, reconnectDelay);
+    }
   };
   ws.onerror = () => setConn('DISCONNECTED', 'disconnected');
 
@@ -139,8 +151,18 @@ function handleServerMessage(msg) {
       setStatus('capture-status', msg.status.toUpperCase(), msg.status === 'running' ? 'live' : 'idle');
       break;
     case 'source':
-      appendLog('source-log', msg.text, msg.interim);
+      if (msg.interim) {
+        showInterimLine(msg.text); // one live line, not 100 log entries
+      } else {
+        clearInterimLine();
+        appendLog('source-log', msg.text, false);
+      }
       break;
+    case 'viewers': {
+      const v = el('viewer-count');
+      if (v) v.textContent = `${msg.count} viewer${msg.count === 1 ? '' : 's'}`;
+      break;
+    }
     case 'translation': {
       if (msg.language) {
         // Host sees all languages with a small tag.
@@ -162,10 +184,6 @@ function handleServerMessage(msg) {
       break;
   }
 }
-
-// Timer handles of the CURRENT recognition instance (quiesce timeout +
-// rolling-commit interval). stopRecognition clears them; set per start.
-let promoteTimers = [];
 
 // ------------------------------------------------------------------
 // Capture + recognition
@@ -238,6 +256,99 @@ async function startCapture() {
   }
 }
 
+// ------------------------------------------------------------------
+// Live committer: turns the recognizer's rolling hypothesis into a stream of
+// NON-overlapping text deltas ("final_text") sent while the speaker is still
+// talking. Chrome's recognizer keeps a result "interim" for a long time and
+// usually adds no punctuation, so waiting for isFinal (or a full sentence)
+// means nothing reaches viewers until capture stops.
+//
+//   - per recognition result index we remember how many tokens (words, or
+//     characters for ja/zh/th) were already sent and only ever send the rest;
+//   - while a result is interim, every TICK_MS the stable part is committed
+//     (all tokens except the last MARGIN ones, which the engine may still
+//     revise) once at least MIN_TOKENS are pending;
+//   - if the hypothesis stops changing for IDLE_MS (speaker paused) or the
+//     recognizer ends, everything pending is committed;
+//   - when a result becomes final, its remaining tail is committed.
+// ------------------------------------------------------------------
+
+function createLiveCommitter(send, lang) {
+  const charMode = /^(ja|zh|th)/i.test(lang || '');
+  const tokenize = (t) => (charMode ? Array.from(t.replace(/\s+/g, '')) : t.trim().split(/\s+/).filter(Boolean));
+  const join = (toks) => (charMode ? toks.join('') : toks.join(' '));
+  const MARGIN = charMode ? 2 : 1;
+  const MIN_TOKENS = charMode ? 6 : 3;
+  const TICK_MS = 800;
+  const IDLE_MS = 1000;
+
+  const sent = new Map(); // result index -> tokens already committed
+  const live = new Map(); // result index -> latest tokens of an interim result
+  let tickTimer = null;
+  let idleTimer = null;
+
+  function commit(i, tokens, upto) {
+    const from = sent.get(i) || 0;
+    if (upto <= from) return;
+    sent.set(i, upto);
+    const text = join(tokens.slice(from, upto));
+    if (text) send(text);
+  }
+
+  function flushLive(all) {
+    for (const [i, tokens] of live) {
+      const upto = all ? tokens.length : tokens.length - MARGIN;
+      const pending = upto - (sent.get(i) || 0);
+      if (pending >= (all ? 1 : MIN_TOKENS)) commit(i, tokens, upto);
+    }
+  }
+
+  function clearTimers() {
+    if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; }
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  }
+
+  return {
+    update(i, text, isFinal) {
+      const tokens = tokenize(text);
+      if (isFinal) {
+        commit(i, tokens, tokens.length);
+        live.delete(i);
+        return;
+      }
+      live.set(i, tokens);
+      if (!tickTimer) {
+        tickTimer = setTimeout(() => { tickTimer = null; flushLive(false); }, TICK_MS);
+      }
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { idleTimer = null; flushLive(true); }, IDLE_MS);
+    },
+    /** Commit everything still pending (recognizer ended / capture stopped). */
+    flushAll() {
+      clearTimers();
+      flushLive(true);
+      live.clear();
+    },
+    dispose() {
+      clearTimers();
+      live.clear();
+    },
+  };
+}
+
+// Throttled display-only interim caption (latest value wins).
+let interimTimer = null;
+let interimPending = null;
+function sendInterimThrottled(text) {
+  interimPending = text;
+  if (interimTimer) return;
+  interimTimer = setTimeout(() => {
+    interimTimer = null;
+    if (interimPending) sendWs({ type: 'interim_text', text: interimPending });
+    interimPending = null;
+  }, 250);
+}
+
 function startRecognition() {
   if (!browserSupportsRecognition()) {
     showCaptureError(
@@ -246,61 +357,29 @@ function startRecognition() {
     );
     return;
   }
+  // Never run two recognizers at once (restart races would duplicate text).
+  if (state.recognition) {
+    try { state.recognition.onend = null; state.recognition.abort(); } catch {}
+    state.committer?.dispose();
+  }
   const RecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
   const recognition = new RecognitionCtor();
   recognition.lang = state.sourceLanguage || 'en-US';
   recognition.continuous = true;
   recognition.interimResults = true;
 
+  const committer = createLiveCommitter((text) => sendWs({ type: 'final_text', text }), recognition.lang);
+  state.committer = committer;
+
   // Did the very first attempt produce anything at all?
   let gotAnyResult = false;
   let firstResultTimer = null;
-
-  // Interim->final promotion: real tab audio keeps long non-final stretches.
-  // TWO mechanisms work together (either alone stalls):
-  //   1. ROLLING COMMITS — every ROLL_COMMIT_MS, the interim hypothesis delta
-  //      since the previous commit is sent as final_text, continuously, even
-  //      while speech keeps changing the hypothesis. This is what makes
-  //      translation LIVE instead of only after Stop capture.
-  //      The server-side segmenter deduplicates repeated/overlapping tails.
-  //   2. QUIESCENCE PROMOTE — if the hypothesis stays unchanged because the
-  //      speaker paused, commit immediately rather than waiting for the tick.
-  const ROLL_COMMIT_MS = 1500;
-  const QUIESCE_PROMOTE_MS = 1000;
-  let committedInterim = '';   // prefix of interim already sent as final_text
-  let lastInterim = '';
-  let lastInterimChangeAt = 0;
-  let promoteTimer = null;
-  let rollTimer = null;
-
-  /** Send the uncommitted tail of the current interim hypothesis. */
-  function commitInterimTail(hyp) {
-    let tail = hyp;
-    if (committedInterim && hyp.startsWith(committedInterim)) {
-      tail = hyp.slice(committedInterim.length);
-    } else if (committedInterim && !hyp.startsWith(committedInterim)) {
-      // Hypothesis was revised (earlier words changed). Send the revised
-      // tail starting at the last uncommitted sentence-ish boundary;
-      // server-side overlap dedupe cleans the seam.
-      const anchor = committedInterim.split(/(?<=[.?!])\s+/).pop() || '';
-      const idx = anchor ? hyp.lastIndexOf(anchor) : -1;
-      tail = idx > -1 ? hyp.slice(idx) : hyp;
-    }
-    tail = (tail || '').trim();
-    if (tail && tail !== state._lastPromoted) {
-      state._lastPromoted = tail;
-      sendWs({ type: 'final_text', text: tail });
-    }
-    committedInterim = hyp;
-  }
 
   const startArgs = [];
   if (state.mode === 'tab' && state.captureStream) {
     const track = state.captureStream.getAudioTracks()[0];
     if (track) startArgs.push(track); // experimental overload — tab audio
   }
-
-  let lastFinalIndex = 0; // index tracking to dedupe restarts
 
   recognition.onresult = (event) => {
     if (!gotAnyResult) {
@@ -314,40 +393,12 @@ function startRecognition() {
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
       const text = result[0]?.transcript ?? '';
-      if (result.isFinal) {
-        // Guard against duplicate finals after engine restarts.
-        if (text && text !== state._lastFinal) {
-          state._lastFinal = text;
-          sendWs({ type: 'final_text', text });
-        }
-        lastFinalIndex = i + 1;
-      } else {
-        interim += text;
-      }
+      if (!text) continue;
+      committer.update(i, text, result.isFinal);
+      if (!result.isFinal) interim += (interim ? ' ' : '') + text.trim();
     }
-    // Interim results: display-only broadcast + two continuous commit paths.
-    if (interim) {
-      sendWs({ type: 'interim_text', text: interim });
-      const now = Date.now();
-      if (interim !== lastInterim) {
-        lastInterim = interim;
-        lastInterimChangeAt = now;
-        if (promoteTimer) clearTimeout(promoteTimer);
-        // Quiescence: hypothesis stabilized while speaker paused → commit now.
-        promoteTimer = setTimeout(() => {
-          if (lastInterim && Date.now() - lastInterimChangeAt >= QUIESCE_PROMOTE_MS - 50) {
-            commitInterimTail(lastInterim);
-          }
-        }, QUIESCE_PROMOTE_MS);
-      }
-    }
+    if (interim) sendInterimThrottled(interim);
   };
-
-  // Rolling commit: continuous translation inflow (runs while recognizing).
-  rollTimer = setInterval(() => {
-    if (state.shouldRestart && lastInterim) commitInterimTail(lastInterim);
-  }, ROLL_COMMIT_MS);
-  promoteTimers = [promoteTimer, rollTimer];
 
   recognition.onerror = (event) => {
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
@@ -382,11 +433,17 @@ function startRecognition() {
   }
 
   recognition.onend = () => {
-    state.recognizing = false;
-    // Auto-restart while capture is active and a mode is still elected, but
-    // never after intentional stop: avoids overlapping sessions/loops.
+    if (firstResultTimer) { clearTimeout(firstResultTimer); firstResultTimer = null; }
+    // The engine ends sessions on its own every so often; whatever was still
+    // interim would be lost, so commit it before restarting.
+    committer.flushAll();
+    if (state.recognition === recognition) {
+      state.recognition = null;
+      state.recognizing = false;
+    }
+    // Auto-restart while capture is active, never after an intentional stop.
     if (state.shouldRestart && (state.mode === 'tab' || state.mode === 'mic')) {
-      setTimeout(() => { if (state.shouldRestart && state.mode !== 'idle') startRecognition(); }, 250);
+      setTimeout(() => { if (state.shouldRestart && state.mode !== 'idle' && !state.recognition) startRecognition(); }, 250);
     }
   };
 
@@ -402,6 +459,7 @@ function startRecognition() {
   } catch (err) {
     // start() can throw InvalidStateError if already started — do not overlap.
     console.warn('recognition start failed:', err);
+    committer.dispose();
     if (state.mode === 'tab') {
       tabRecognitionUnavailable('Direct tab-audio recognition was rejected on start (' + (err?.name ?? 'Error') + ').');
     }
@@ -433,10 +491,9 @@ function setStatusSafe(text, cls) {
 
 function stopRecognition({ intentional = false } = {}) {
   state.shouldRestart = false;
-  for (const t of promoteTimers) {
-    try { clearInterval(t); clearTimeout(t); } catch {}
-  }
-  promoteTimers = [];
+  // Send whatever is still pending BEFORE tearing the recognizer down.
+  if (state.committer) { state.committer.flushAll(); state.committer = null; }
+  if (interimTimer) { clearTimeout(interimTimer); interimTimer = null; interimPending = null; }
   if (state.recognition) {
     try { state.recognition.onend = null; state.recognition.abort(); } catch {}
     state.recognition = null;
@@ -498,6 +555,22 @@ function showCaptureError(message) {
   p.hidden = false;
 }
 
+function showInterimLine(text) {
+  const log = el('source-log');
+  let line = log.querySelector('.log-item.interim');
+  if (!line) {
+    line = document.createElement('div');
+    line.className = 'log-item interim';
+    log.appendChild(line);
+  }
+  line.textContent = text;
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearInterimLine() {
+  el('source-log').querySelector('.log-item.interim')?.remove();
+}
+
 function appendLog(logId, text, isInterim, tag) {
   const log = el(logId);
   const item = document.createElement('div');
@@ -512,7 +585,9 @@ function appendLog(logId, text, isInterim, tag) {
   // Safe rendering: textContent, never innerHTML (XSS-safe).
   span.textContent = text;
   item.appendChild(span);
-  log.appendChild(item);
+  const interimLine = log.querySelector('.log-item.interim');
+  if (interimLine) log.insertBefore(item, interimLine);
+  else log.appendChild(item);
   while (log.childNodes.length > 100) log.removeChild(log.firstChild);
   log.scrollTop = log.scrollHeight;
 }

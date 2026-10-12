@@ -127,6 +127,10 @@ input[type="checkbox"] { accent-color: var(--accent); }
   padding: 0.4rem 1rem;
 }
 
+/* Finished captions can be clicked to hear them read aloud. */
+.subtitle.speakable { cursor: pointer; }
+.subtitle.speakable:hover { background: rgba(127, 127, 127, 0.12); border-radius: 8px; }
+
 /* Source line shown while its translation is in flight. */
 .subtitle.pending {
   opacity: 0.45;

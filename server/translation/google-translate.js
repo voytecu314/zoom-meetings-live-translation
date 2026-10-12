@@ -17,7 +17,7 @@ export function createGoogleTranslateProvider() {
     async translate(text, sourceLanguage, targetLanguage) {
       const lib = await import('google-translate-api-x');
       const translateFn = lib.default ?? lib;
-      const opts = { to: targetLanguage };
+      const opts = { to: normalize(targetLanguage) };
       // auto-save automatic source detection unless explicitly given
       if (sourceLanguage && sourceLanguage !== 'auto') {
         opts.from = normalize(sourceLanguage);
@@ -28,16 +28,15 @@ export function createGoogleTranslateProvider() {
   };
 }
 
-/** Map BCP-47 "en-US" → ISO-639-1 "en" for provider input. */
+/**
+ * Map the app's BCP-47-ish codes ("en-US", "pt-BR", "zh") to the codes
+ * google-translate-api-x accepts. That library only knows "zh-CN"/"zh-TW"
+ * (plain "zh" throws "language not supported"), and "he"/"iw" etc.
+ */
 export function normalize(lang) {
   if (!lang) return 'auto';
-  const lower = lang.toLowerCase();
+  const lower = String(lang).toLowerCase();
   const [base, region] = lower.split('-');
-  // google-translate-api-x handles region variants like pt-BR fine, but the
-  // base code is safer for less common pairs.
-  if (region && ['en', 'es', 'pt', 'fr', 'de', 'zh', 'ar', 'hi'].includes(base)) {
-    // Return base — good enough for consumer endpoints.
-    return base;
-  }
+  if (base === 'zh') return region === 'tw' || region === 'hk' ? 'zh-TW' : 'zh-CN';
   return base || lower;
 }

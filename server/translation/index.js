@@ -64,6 +64,12 @@ function ensureLimiter() {
  */
 export async function translateText(text, sourceLanguage, targetLanguage) {
   if (!text?.trim()) return { ok: true, text: '' };
+  // Nothing to translate when the viewer language equals the spoken language
+  // (e.g. source en-US, target "en"): show the recognized text as-is.
+  if (sourceLanguage && targetLanguage &&
+      String(sourceLanguage).split('-')[0].toLowerCase() === String(targetLanguage).split('-')[0].toLowerCase()) {
+    return { ok: true, text };
+  }
   ensureLimiter();
   try {
     const result = await limiter.run(async () => {
@@ -79,16 +85,18 @@ export async function translateText(text, sourceLanguage, targetLanguage) {
             p = await getGoogleProvider();
             provider = p;
           }
+          let timer;
           const withTimeout = Promise.race([
             p.translate(text, sourceLanguage, targetLanguage),
-            new Promise((_, reject) =>
-              setTimeout(
+            new Promise((_, reject) => {
+              timer = setTimeout(
                 () => reject(new TranslationError('translation timed out', { retryable: true })),
                 config.translation.timeoutMs
-              )
-            ),
+              );
+            }),
           ]);
-          const out = await withTimeout;
+          let out;
+          try { out = await withTimeout; } finally { clearTimeout(timer); }
           if (typeof out !== 'string') {
             throw new TranslationError('provider returned non-string result');
           }

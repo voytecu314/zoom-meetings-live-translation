@@ -218,10 +218,10 @@ export function createSegmenter(options = {}) {
     return recent.includes(s);
   }
 
-  function emitRange(from, to, sentences) {
+  function emitRange(from, to, sentences, dedupe = true) {
     const raw = accumulated.slice(from, to);
     const trimmed = raw.trim();
-    if (!trimmed || isDuplicate(trimmed)) return;
+    if (!trimmed || (dedupe && isDuplicate(trimmed))) return;
     pushRecent(trimmed);
     sentences.push(trimmed);
   }
@@ -246,6 +246,11 @@ export function createSegmenter(options = {}) {
    */
   function feed(text, opts = {}) {
     const isFragment = !!opts.isFragment;
+    // dedupe=false is used for LIVE streaming: the host sends exact,
+    // non-overlapping deltas, so restart-overlap stripping and the
+    // repeated-sentence filter would only ever drop legitimate speech
+    // ("no no no", "Thank you." said twice).
+    const dedupe = opts.dedupe !== false;
     if (!text) return [];
 
     // Restart overlap: engines repeat ALL unprocessed text since their last
@@ -253,7 +258,7 @@ export function createSegmenter(options = {}) {
     // the WHOLE unprocessed buffer — and strip it. Partial prefix matches are
     // NOT stripped: they are usually genuine new text that happens to begin
     // with the same words (stripping those destroyed real sentences).
-    if (accumulated.length > cursor) {
+    if (dedupe && accumulated.length > cursor) {
       const bufferedLen = accumulated.length - cursor;
       const maxLen = Math.min(bufferedLen, text.length, 512);
       if (maxLen === bufferedLen) {
@@ -265,12 +270,17 @@ export function createSegmenter(options = {}) {
     }
     if (!text) return [];
 
+    // Keep memory bounded on long meetings: drop the already-emitted prefix.
+    if (cursor > 4096) {
+      accumulated = accumulated.slice(cursor);
+      cursor = 0;
+    }
     accumulated += text;
     const sentences = [];
 
     const ends = findSentenceEnds(accumulated).filter((e) => e > cursor);
     for (const end of ends) {
-      emitRange(cursor, end, sentences);
+      emitRange(cursor, end, sentences, dedupe);
       cursor = end;
     }
 
@@ -285,7 +295,7 @@ export function createSegmenter(options = {}) {
     if (maxBufferChars > 0 && buffered > maxBufferChars) {
       const cut = findClauseBoundary(accumulated, cursor, accumulated.length);
       if (cut > cursor) {
-        emitRange(cursor, cut, sentences);
+        emitRange(cursor, cut, sentences, dedupe);
         cursor = cut;
       }
     } else if (isFragment) {
@@ -297,7 +307,7 @@ export function createSegmenter(options = {}) {
       // dedupe + recent-window prevents repetition.
       const stillBuffered = accumulated.length - cursor;
       if (stillBuffered >= 3) {
-        emitRange(cursor, accumulated.length, sentences);
+        emitRange(cursor, accumulated.length, sentences, dedupe);
         cursor = accumulated.length;
       }
     }
@@ -310,11 +320,11 @@ export function createSegmenter(options = {}) {
    * @param {boolean} [translate=true] when false the fragment is discarded.
    * @returns {string|null}
    */
-  function flush(translate = true) {
+  function flush(translate = true, { dedupe = true } = {}) {
     const remaining = accumulated.slice(cursor).trim();
     cursor = accumulated.length;
     if (!remaining) return null;
-    if (!translate || isDuplicate(remaining)) return null;
+    if (!translate || (dedupe && isDuplicate(remaining))) return null;
     pushRecent(remaining);
     return remaining;
   }

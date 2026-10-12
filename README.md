@@ -47,7 +47,10 @@ Copy `.env.example` to `.env` and edit. All settings have working defaults
 | Var | Meaning |
 |-----|---------|
 | `PORT` | HTTP+WS port (default 3000) |
-| `PUBLIC_BASE_URL` | Base for viewer links, e.g. `https://sub.example.com` |
+| `PUBLIC_BASE_URL` | Optional. Base for viewer links, e.g. `https://sub.example.com`. If unset, derived from the host's request |
+| `TRUST_PROXY` | `true` (default): use `X-Forwarded-For` for per-IP limits behind a proxy/tunnel |
+| `STREAM_MIN_WORDS` | Words buffered before a not-yet-finished sentence is translated live (default 8) |
+| `PAUSE_THRESHOLD_MS` | Pause length (ms) after which buffered speech is translated (default 1200) |
 | `TRANSLATION_PROVIDER` | `mock` (dev, free, offline) or `google-x` |
 | `TRANSLATION_CONCURRENCY` | Max parallel translation requests (default 4) |
 | `TRANSLATION_TIMEOUT_MS` | Per-request timeout (default 8000) |

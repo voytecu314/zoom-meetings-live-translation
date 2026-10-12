@@ -3,6 +3,7 @@
 // expiry. Storage is in-memory only — nothing about the meeting is persisted.
 
 import { randomBytes } from 'node:crypto';
+import { config } from './config.js';
 
 const sessions = new Map(); // sessionId -> session object
 
@@ -39,6 +40,8 @@ export function createSession({ sourceLanguage, targetLanguages, hostSocket = nu
     pendingTranslations: new Map(),
     // last time a recognized sentence arrived (for staleness detection)
     lastSpeechAt: now,
+    // catch-up buffer size for late joiners (source + translation entries)
+    historyLimit: config.sessions.historyLimit,
   };
   sessions.set(id, session);
   return session;
@@ -58,7 +61,7 @@ export function closeSession(id) {
   const s = sessions.get(id);
   if (!s) return;
   s.closed = true;
-  if (s._srvQuiesce) { clearTimeout(s._srvQuiesce); s._srvQuiesce = null; }
+  if (s._idleTimer) { clearTimeout(s._idleTimer); s._idleTimer = null; }
   if (s.hostSocket) {
     s.hostSocket.close();
     s.hostSocket = null;
@@ -120,7 +123,7 @@ export function recordTranslation(session, sequence, language, text) {
 
 export function pushHistory(session, entry) {
   session.history.push(entry);
-  const limit = session.historyLimit ?? 40;
+  const limit = session.historyLimit ?? 200;
   while (session.history.length > limit) session.history.shift();
 }
 
