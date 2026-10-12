@@ -71,6 +71,22 @@ function countUnits(text) {
   return words > 1 ? words : Math.ceil(t.length / 2);
 }
 
+/** Most recent finalized lines of a session (context for LLM translation). */
+function rememberRecent(session, sequence, source) {
+  const r = session._recent ?? (session._recent = []);
+  r.push({ sequence, source, translations: {} });
+  while (r.length > 8) r.shift();
+}
+
+function contextFor(session, sequence, lang) {
+  const n = config.llm.contextLines;
+  if (!n) return [];
+  return (session._recent ?? [])
+    .filter((e) => e.sequence < sequence)
+    .slice(-n)
+    .map((e) => ({ source: e.source, translation: e.translations[lang] }));
+}
+
 /** Per-session state of the utterance that is currently open. */
 function utt(session) {
   if (!session._utt) session._utt = { seq: null, text: '', langs: new Map() };
@@ -116,6 +132,7 @@ function finalizeUtterance(session, text, broadcast) {
     sequence = nextSequence(session, text).sequence;
   }
   resetUtterance(session);
+  rememberRecent(session, sequence, text);
   broadcast(session.id, { type: 'source', sessionId: session.id, sequence, text, final: true });
   dispatchTranslations(session, sequence, text, broadcast);
   return { sequence, text };
@@ -154,7 +171,7 @@ async function runDraft(session, lang, d, broadcast) {
   d.lastUnits = countUnits(text);
   let result = null;
   try {
-    result = await translateText(text, session.sourceLanguage, lang);
+    result = await translateText(text, session.sourceLanguage, lang, { quality: 'draft' });
   } catch (err) {
     log(`session ${session.id} seq ${sequence} draft CRASHED (${lang}): ${err?.message ?? err}`);
   }
@@ -212,6 +229,43 @@ export function ingestFinalText(session, text, broadcast) {
   return finalized;
 }
 
+// A pause right after one of these words almost never ends a sentence
+// ("...if you don't do that and <pause> you come here"). English only; other
+// languages simply get no hold-back.
+const DANGLING_EN = new Set([
+  'and', 'but', 'or', 'so', 'because', 'if', 'that', 'which', 'who', 'when', 'while', 'although',
+  'the', 'a', 'an', 'to', 'of', 'in', 'on', 'at', 'for', 'with', 'by', 'from', 'than', 'as',
+  'i', 'you', 'he', 'she', 'we', 'they', 'it', 'is', 'are', 'was', 'were', 'be', 'have', 'has',
+  'my', 'your', 'his', 'her', 'our', 'their', 'this', 'these', 'those', 'not', "don't", 'do',
+]);
+
+function endsDangling(session, text) {
+  if (!/^en/i.test(session.sourceLanguage || 'en')) return false;
+  const last = text.trim().toLowerCase().replace(/[^a-z']+$/g, '').split(/\s+/).pop();
+  return DANGLING_EN.has(last);
+}
+
+/**
+ * Host-detected pause. Like flushSession, but when the text stops on a
+ * dangling word the utterance is kept open for danglingHoldMs more, so the
+ * continuation joins it instead of becoming a separate (mistranslated) line.
+ */
+export function pauseSession(session, broadcast) {
+  const segmenter = getSegmenterFor(session);
+  const buffered = segmenter.bufferedText().trim();
+  const { danglingHoldMs } = config.segmentation;
+  if (buffered && danglingHoldMs > 0 && endsDangling(session, buffered)) {
+    clearIdleTimer(session);
+    session._idleTimer = setTimeout(() => {
+      session._idleTimer = null;
+      if (!session.closed) flushSession(session, { translate: true }, broadcast);
+    }, danglingHoldMs);
+    session._idleTimer.unref?.();
+    return null;
+  }
+  return flushSession(session, { translate: true }, broadcast);
+}
+
 /**
  * End the open utterance now (speaker paused / capture stopped) and send its
  * final translation. With translate:false the leftover is discarded.
@@ -232,7 +286,10 @@ function dispatchTranslations(session, sequence, text, broadcast) {
     if (!claimTranslation(session, sequence, lang)) continue; // already requested
     void (async () => {
       try {
-        const result = await translateText(text, session.sourceLanguage, lang);
+        const result = await translateText(text, session.sourceLanguage, lang, {
+          quality: 'final',
+          context: contextFor(session, sequence, lang),
+        });
         completeTranslation(session, sequence, lang);
         if (!result.ok) {
           log(`session ${session.id} seq ${sequence} FAILED (${lang}): ${result.error}`);
@@ -240,6 +297,8 @@ function dispatchTranslations(session, sequence, text, broadcast) {
           return;
         }
         recordTranslation(session, sequence, lang, result.text);
+        const recent = session._recent?.find((e) => e.sequence === sequence);
+        if (recent) recent.translations[lang] = result.text;
         log(`session ${session.id} seq ${sequence} [${lang}]: "${truncate(result.text)}"`);
         broadcast(session.id, {
           type: 'translation',

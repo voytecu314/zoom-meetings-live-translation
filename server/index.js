@@ -11,6 +11,7 @@ import { config } from './config.js';
 import { createSession, getSession, closeSession } from './sessions.js';
 import { setupWebSocket } from './websocket.js';
 import { createTranscriptionProvider } from './transcription/index.js';
+import { initTranslationProvider } from './translation/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -150,11 +151,16 @@ if (transcriptionProvider) {
   console.log(`[http] server-side transcription provider: ${transcriptionProvider.name}`);
 }
 
+// Fail fast on a bad TRANSLATION_PROVIDER / missing LLM_API_KEY.
+initTranslationProvider();
+
 httpServer.listen(config.env.port, () => {
   console.log(`zoom-live-translate listening on http://localhost:${config.env.port}`);
   console.log(`  host page:  ${config.env.publicBaseUrl}/host`);
   console.log(`  health:     http://localhost:${config.env.port}/health`);
-  console.log(`  env:        ${config.env.nodeEnv}, provider=${config.translation.provider}`);
+  console.log(`  env:        ${config.env.nodeEnv}, provider=${config.translation.provider}` +
+    (config.translation.fallback ? `, fallback=${config.translation.fallback}` : '') +
+    (config.translation.provider === 'llm' ? `, model=${config.llm.model}` : ''));
 });
 
 export { app, httpServer, ws };

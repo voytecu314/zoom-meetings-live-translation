@@ -35,10 +35,29 @@ export const config = {
   },
 
   translation: {
+    // mock | google-x | llm
     provider: process.env.TRANSLATION_PROVIDER || 'mock',
+    // Used when the primary provider fails or is over quota ('' = none).
+    // Defaults to google-x when the primary is llm.
+    fallback: process.env.TRANSLATION_FALLBACK ?? (process.env.TRANSLATION_PROVIDER === 'llm' ? 'google-x' : ''),
     apiKey: process.env.TRANSLATION_API_KEY || '',
     concurrency: Math.max(1, int(process.env.TRANSLATION_CONCURRENCY, 4)),
     timeoutMs: Math.max(500, int(process.env.TRANSLATION_TIMEOUT_MS, 8000)),
+  },
+
+  // OpenAI-compatible chat API used by TRANSLATION_PROVIDER=llm.
+  llm: {
+    baseUrl: process.env.LLM_BASE_URL || 'https://router.bynara.id/v1',
+    apiKey: process.env.LLM_API_KEY || '',
+    model: process.env.LLM_MODEL || 'deepseek-v4-flash',
+    timeoutMs: Math.max(1000, int(process.env.LLM_TIMEOUT_MS, 6000)),
+    reasoningEffort: process.env.LLM_REASONING_EFFORT ?? 'none',
+    // After a quota/auth error, skip the LLM for this long (it is retried afterwards).
+    quotaCooldownMs: Math.max(1000, int(process.env.LLM_QUOTA_COOLDOWN_MS, 600000)),
+    // Also use the LLM for live drafts (default: drafts use the fallback MT to save quota).
+    drafts: (process.env.LLM_DRAFTS ?? 'false') === 'true',
+    // How many earlier lines are sent as context with each final translation.
+    contextLines: Math.max(0, int(process.env.LLM_CONTEXT_LINES, 3)),
   },
 
   transcription: {
@@ -64,9 +83,12 @@ export const config = {
     // punctuation, at a speaker pause signalled by the host, or - as a
     // fallback if that signal is lost - after this many ms without new text.
     pauseThresholdMs: Math.max(200, int(process.env.PAUSE_THRESHOLD_MS, 1800)),
+    // A host-detected pause right after a dangling word ("and", "the", "to"...)
+    // keeps the utterance open this long (ms) before finalizing. 0 disables.
+    danglingHoldMs: Math.max(0, int(process.env.DANGLING_HOLD_MS, 3000)),
     // Safety valve: an utterance this long (words; ~2 chars each for ja/zh/th)
     // is finalized even without a pause, to bound latency.
-    maxUtteranceWords: Math.max(8, int(process.env.MAX_UTTERANCE_WORDS, 40)),
+    maxUtteranceWords: Math.max(8, int(process.env.MAX_UTTERANCE_WORDS, 60)),
     // Live DRAFT translations of the still-open utterance (replaced in place
     // on the viewer, never spoken). Costs extra translation requests.
     draftTranslations: (process.env.DRAFT_TRANSLATIONS ?? 'true') !== 'false',

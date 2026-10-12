@@ -74,7 +74,12 @@ boundaries cannot be found in the text. Translation is therefore done per
 2. On a pause (host sends `utterance_end` after ~1.2 s of silence or when
    Chrome finalizes a result; server timer as fallback), one **final**
    translation of the complete utterance replaces the draft.
-3. Only finals are read aloud and stored in the catch-up history.
+3. With `TRANSLATION_PROVIDER=llm`, finals are translated by an LLM that also
+   sees the previous lines (punctuation, misheard words, interruptions) while
+   drafts stay on Google. On any LLM error or an exhausted quota the call falls
+   back to `google-x`, and the LLM is skipped for a cooldown. A pause right
+   after a dangling word ("and", "the"...) is held open (`DANGLING_HOLD_MS`).
+4. Only finals are read aloud and stored in the catch-up history.
 
 If the recognizer does emit sentence punctuation, it also ends utterances.
 

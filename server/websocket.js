@@ -44,7 +44,7 @@ import {
   getSession,
   closeSession,
 } from './sessions.js';
-import { disposeSessionResources, flushSession, ingestFinalText, configureSessionSegmentation } from './pipeline.js';
+import { disposeSessionResources, flushSession, pauseSession, ingestFinalText, configureSessionSegmentation } from './pipeline.js';
 import { config } from './config.js';
 
 const connectionsPerIp = new Map(); // ip -> count
@@ -345,7 +345,7 @@ export function setupWebSocket(server, httpServer) {
       case 'utterance_end': {
         // Host detected a pause in speech: close the open utterance now so its
         // final, full-context translation is produced without waiting.
-        flushSession(session, { translate: true }, (id, obj) => safeBroadcast(id, obj));
+        pauseSession(session, (id, obj) => safeBroadcast(id, obj));
         break;
       }
 

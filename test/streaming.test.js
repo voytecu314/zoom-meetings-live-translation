@@ -94,6 +94,29 @@ test('pause fallback timer finalizes when utterance_end is lost', async () => {
   host.close(); viewer.close();
 });
 
+test('a pause right after a dangling word keeps the utterance open and joins the continuation', async () => {
+  const prev = config.segmentation.danglingHoldMs;
+  config.segmentation.danglingHoldMs = 1500;
+  const s = createSession({ sourceLanguage: 'en-US', targetLanguages: ['de'] });
+  const viewer = await open(`/ws/live?session=${s.id}`);
+  const host = await open(`/ws/host?session=${s.id}&token=${s.hostToken}`);
+  try {
+    host.send(JSON.stringify({ type: 'final_text', text: 'if you do not do that and' }));
+    host.send(JSON.stringify({ type: 'utterance_end' }));
+    await sleep(600);
+    assert.equal(translations(viewer).filter((t) => t.final === true).length, 0, 'held back, not cut after "and"');
+    host.send(JSON.stringify({ type: 'final_text', text: 'you come here on a small boat' }));
+    host.send(JSON.stringify({ type: 'utterance_end' }));
+    await sleep(300);
+    const finals = translations(viewer).filter((t) => t.final === true);
+    assert.equal(finals.length, 1);
+    assert.match(finals[0].text, /do that and you come here on a small boat/);
+  } finally {
+    config.segmentation.danglingHoldMs = prev;
+    host.close(); viewer.close();
+  }
+});
+
 test('punctuation, when present, closes sentences; the unfinished rest stays open', async () => {
   const s = createSession({ sourceLanguage: 'en-US', targetLanguages: ['de'] });
   const viewer = await open(`/ws/live?session=${s.id}`);
