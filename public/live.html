@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live subtitles</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="live">
+    <header class="live-header">
+      <div id="live-status" class="badge connecting">CONNECTING</div>
+      <div class="controls">
+        <label class="inline-label">Language
+          <select id="language-select" aria-label="Subtitle language"></select>
+        </label>
+        <label class="inline-label">Font size
+          <input id="font-size" type="range" min="16" max="56" value="28" aria-label="Font size" />
+        </label>
+        <label class="inline-label toggle">
+          <input id="speak-toggle" type="checkbox" />
+          Speak
+        </label>
+        <button id="pause-speech" type="button" class="secondary" hidden>Pause speech</button>
+        <button id="clear" type="button" class="secondary">Clear</button>
+      </div>
+    </header>
+
+    <section id="waiting" class="waiting">
+      <p>Waiting for speech to be translated…</p>
+      <p class="note">This page updates automatically when the host speaks. No account needed.</p>
+    </section>
+
+    <section id="subtitles" class="subtitles" aria-live="polite" aria-atomic="false"></section>
+
+    <section class="source-captions">
+      <label class="inline-label toggle">
+        <input id="show-source" type="checkbox" />
+        Show source-language captions
+      </label>
+      <div id="source-captions-log" class="log" hidden></div>
+    </section>
+  </main>
+  <script type="module" src="/live.js"></script>
+</body>
+</html>

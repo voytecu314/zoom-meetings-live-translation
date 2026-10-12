@@ -1,0 +1,22 @@
+{
+  "name": "zoom-live-translate",
+  "version": "0.1.0",
+  "description": "Live translated subtitles for Zoom meetings (browser capture + recognition + server broadcast)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "google-translate-api-x": "^10.2.0"
+  },
+  "devDependencies": {}
+}
