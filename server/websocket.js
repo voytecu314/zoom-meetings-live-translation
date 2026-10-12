@@ -34,6 +34,7 @@
 //   messages are scoped to the session the socket belongs to.
 // - Payload size limits + per-IP connection caps + heartbeats handled here.
 
+import { createLogger } from './log.js';
 import { WebSocketServer } from 'ws';
 import {
   addViewer,
@@ -49,8 +50,9 @@ import { config } from './config.js';
 
 const connectionsPerIp = new Map(); // ip -> count
 
+const logger = createLogger('ws');
 function log(...args) {
-  console.log('[ws]', ...args);
+  logger.info(...args);
 }
 
 function safeSend(socket, obj) {
@@ -337,7 +339,7 @@ export function setupWebSocket(server, httpServer) {
           safeSend(socket, { type: 'error', recoverable: true, message: 'final_text too long' });
           return;
         }
-        log(`session ${session.id}: final_text (${text.length} chars): "${text.replace(/\s+/g, ' ').slice(0, 80)}"`);
+        logger.debug(`session ${session.id}: final_text (${text.length} chars): "${text.replace(/\s+/g, ' ').slice(0, 80)}"`);
         ingestFinalText(session, text, safeBroadcast);
         break;
       }

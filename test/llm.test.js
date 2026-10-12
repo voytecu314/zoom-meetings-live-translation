@@ -90,3 +90,25 @@ test('transient 500s fall back per call; circuit opens after 3 failures', async 
 test('missing api key is rejected up front', () => {
   assert.throws(() => createLlmProvider({ baseUrl, apiKey: '', model: 'x' }), /LLM_API_KEY/);
 });
+
+test('request budget: over-budget lines go to the fallback without calling the LLM (no 429s provoked)', async () => {
+  const { config } = await import('../server/config.js');
+  const prev = { ...config.llm };
+  config.llm.maxRpm = 2;
+  config.llm.maxWaitMs = 0;
+  const p = llm();
+  __setChainForTests({ final: [{ name: 'llm', translate: (t, s, l, o) => p.translate(t, s, l, o) }, mt()], draft: [mt()] });
+  try {
+    const providers = [];
+    for (const t of ['one', 'two', 'three', 'four']) {
+      providers.push((await translateText(t, 'en', 'de', { quality: 'final' })).provider);
+    }
+    assert.deepEqual(providers, ['llm', 'llm', 'google-x', 'google-x']);
+    assert.equal(requests.length, 2, 'LLM saw only the budgeted requests');
+    // a budget miss is not a failure: the circuit must stay closed
+    const health = await translateText('five', 'en', 'de', { quality: 'final' });
+    assert.equal(health.provider, 'google-x');
+  } finally {
+    Object.assign(config.llm, prev);
+  }
+});

@@ -4,6 +4,7 @@
 // WebSocket delivery to host + viewers. All translation work is async and
 // never blocks subsequent source broadcasting.
 
+import { createLogger } from './log.js';
 import { createSegmenter, ABBREVIATION_PACKS } from './sentence-segmenter.js';
 import { translateText } from './translation/index.js';
 import { config } from './config.js';
@@ -81,10 +82,19 @@ function rememberRecent(session, sequence, source) {
 function contextFor(session, sequence, lang) {
   const n = config.llm.contextLines;
   if (!n) return [];
-  return (session._recent ?? [])
+  const picked = (session._recent ?? [])
     .filter((e) => e.sequence < sequence)
     .slice(-n)
     .map((e) => ({ source: e.source, translation: e.translations[lang] }));
+  // Keep the prompt small: drop the oldest lines beyond a character budget.
+  let chars = 0;
+  const out = [];
+  for (let i = picked.length - 1; i >= 0; i--) {
+    chars += picked[i].source.length + (picked[i].translation?.length ?? 0);
+    if (chars > config.llm.contextChars && out.length) break;
+    out.unshift(picked[i]);
+  }
+  return out;
 }
 
 /** Per-session state of the utterance that is currently open. */
@@ -173,7 +183,7 @@ async function runDraft(session, lang, d, broadcast) {
   try {
     result = await translateText(text, session.sourceLanguage, lang, { quality: 'draft' });
   } catch (err) {
-    log(`session ${session.id} seq ${sequence} draft CRASHED (${lang}): ${err?.message ?? err}`);
+    warn(`session ${session.id} seq ${sequence} draft CRASHED (${lang}): ${err?.message ?? err}`);
   }
   d.inflight = false;
   // Utterance finalized (or session closed) while we were waiting: drop it.
@@ -292,13 +302,15 @@ function dispatchTranslations(session, sequence, text, broadcast) {
         });
         completeTranslation(session, sequence, lang);
         if (!result.ok) {
-          log(`session ${session.id} seq ${sequence} FAILED (${lang}): ${result.error}`);
+          warn(`session ${session.id} seq ${sequence} translation FAILED (${lang}): ${result.error}`);
           notifyHost(session, `translation failed (seq ${sequence}, ${lang}): ${result.error}`);
           return;
         }
         recordTranslation(session, sequence, lang, result.text);
         const recent = session._recent?.find((e) => e.sequence === sequence);
-        if (recent) recent.translations[lang] = result.text;
+        // Only the LLM's own output is used as a style/terminology example for
+        // later lines; don't feed back lower-quality fallback MT.
+        if (recent && result.provider === 'llm') recent.translations[lang] = result.text;
         log(`session ${session.id} seq ${sequence} [${lang}]: "${truncate(result.text)}"`);
         broadcast(session.id, {
           type: 'translation',
@@ -310,7 +322,7 @@ function dispatchTranslations(session, sequence, text, broadcast) {
         });
       } catch (err) {
         completeTranslation(session, sequence, lang);
-        log(`session ${session.id} seq ${sequence} CRASHED (${lang}): ${err?.message ?? err}`);
+        warn(`session ${session.id} seq ${sequence} translation CRASHED (${lang}): ${err?.message ?? err}`);
         notifyHost(session, `translation crashed (seq ${sequence}, ${lang}): ${err?.message ?? err}`);
       }
     })();
@@ -334,8 +346,12 @@ function truncate(s, n = 60) {
   s = String(s).replace(/\s+/g, ' ').trim();
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
+const logger = createLogger('pipeline');
 function log(...args) {
-  if (logEnabled) console.log('[pipeline]', ...args);
+  if (logEnabled) logger.debug(...args);
+}
+function warn(...args) {
+  if (logEnabled) logger.warn(...args);
 }
 
 /** Update per-session segmentation settings (source language change etc.). */

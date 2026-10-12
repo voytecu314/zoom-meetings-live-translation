@@ -4,6 +4,8 @@
 
 const el = (id) => document.getElementById(id);
 
+import { createSpeechQueue } from '/speech-queue.js';
+
 const state = {
   sessionId: location.pathname.split('/').pop(),
   ws: null,
@@ -13,12 +15,10 @@ const state = {
   // sequence -> { text: '' , translations: Map(lang->text)} for ordering
   sourceLines: new Map(),
   historyLoaded: false,
-  speaking: false,
-  speechQueue: [],     // ordered [{sequence, text}]
-  spokenUpTo: -1,
-  speakingNow: null,   // current utterance bookkeeping
   speechEnabled: false,
-  queuedSeqs: new Set(), // sequences already queued for speech (no duplicates)
+  speechRate: 1,        // user's reading speed (slider)
+  autoCatchUp: true,    // read faster while behind instead of skipping lines
+  speakingSeq: null,    // line being read right now
   reconnectDelay: 1000,
   reconnectTimer: null,
   closedByServer: false,
@@ -121,7 +121,7 @@ function handle(msg) {
         break;
       }
       clearInterimSource();
-      rememberSource(msg.sequence, msg.text);
+      rememberSource(msg.sequence, msg.text, msg.final !== false);
       // Translations lag recognition by a second or three on real providers;
       // show the SOURCE line dimmed immediately, replaced by its translation
       // when it arrives (swap happens automatically on the next render()).
@@ -165,16 +165,18 @@ function handle(msg) {
 // Data model: keep source text + per-language translations keyed by sequence
 // ------------------------------------------------------------------
 
-function rememberSource(sequence, text) {
+function rememberSource(sequence, text, sourceFinal = true) {
   if (!state.sourceLines.has(sequence)) {
-    state.sourceLines.set(sequence, { text, translations: new Map() });
+    state.sourceLines.set(sequence, { text, translations: new Map(), sourceFinal });
     // keep memory bounded
     if (state.sourceLines.size > 200) {
       const oldest = Math.min(...state.sourceLines.keys());
       state.sourceLines.delete(oldest);
     }
   } else {
-    state.sourceLines.get(sequence).text = text;
+    const e = state.sourceLines.get(sequence);
+    e.text = text;
+    e.sourceFinal = e.sourceFinal || sourceFinal;
   }
 }
 
@@ -225,7 +227,8 @@ function render() {
     anyShown = true;
     const div = document.createElement('div');
     const isDraft = !pending && entry.draft === true;
-    div.className = 'subtitle' + (pending ? ' pending' : '') + (isDraft ? ' draft' : '');
+    div.className = 'subtitle' + (pending ? ' pending' : '') + (isDraft ? ' draft' : '') +
+      (entry.skipped ? ' skipped' : '') + (state.speakingSeq === seq ? ' speaking' : '');
     div.dataset.sequence = String(seq);
     div.textContent = text; // XSS-safe
     if (!pending && !isDraft) {
@@ -285,33 +288,61 @@ const LANGUAGE_LABELS = {
 // Optional speech synthesis (browser speechSynthesis)
 // ------------------------------------------------------------------
 
-const MAX_SPEECH_BACKLOG = 3; // if reading falls behind, skip ahead to stay live
+function markSpeakingLine(seq) {
+  state.speakingSeq = seq;
+  for (const n of el('subtitles').querySelectorAll('.subtitle.speaking')) n.classList.remove('speaking');
+  if (seq != null) el('subtitles').querySelector(`.subtitle[data-sequence="${seq}"]`)?.classList.add('speaking');
+}
+
+let speechQueue = null;
+function speech() {
+  if (speechQueue) return speechQueue;
+  speechQueue = createSpeechQueue({
+    synth: speechSynthesis,
+    makeUtterance: (text, lang) => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = mapToVoiceLocale(lang);
+      const voice = pickVoice(u.lang);
+      if (voice) u.voice = voice;
+      return u;
+    },
+    getRate: () => state.speechRate,
+    autoCatchUp: () => state.autoCatchUp,
+    isPaused: () => speechSynthesis.paused,
+    // A lower line is final but its translation has not arrived yet: read it first.
+    hasPendingBefore: (seq, spokenUpTo) => {
+      const lang = languageInUse() || state.targetLanguages[0];
+      for (const [s, e] of state.sourceLines) {
+        if (s < seq && s > spokenUpTo && e.sourceFinal && !e.translations.get(lang)) return true;
+      }
+      return false;
+    },
+    onSkip: (seqs) => {
+      for (const q of seqs) {
+        const e = state.sourceLines.get(q);
+        if (e) e.skipped = true;
+      }
+      render(); // skipped lines are marked; click one to hear it
+    },
+    onState: markSpeakingLine,
+  });
+  return speechQueue;
+}
 
 function markAllAsSpoken() {
   // Treat everything we currently have as "already seen": turning speech on
   // starts from NOW instead of reading the whole backlog.
-  for (const seq of state.sourceLines.keys()) {
-    state.spokenUpTo = Math.max(state.spokenUpTo, seq);
-  }
+  if (!('speechSynthesis' in window)) return;
+  for (const seq of state.sourceLines.keys()) speech().markSpoken(seq);
 }
 
 function enqueueSpeech(sequence) {
-  if (!state.speechEnabled) return;
+  if (!state.speechEnabled || !('speechSynthesis' in window)) return;
   const lang = languageInUse() || state.targetLanguages[0];
   if (!lang) return;
-  const entry = state.sourceLines.get(sequence);
-  const text = entry?.translations.get(lang);
+  const text = state.sourceLines.get(sequence)?.translations.get(lang);
   if (!text) return;
-  if (sequence <= state.spokenUpTo || state.queuedSeqs.has(sequence)) return;
-  state.queuedSeqs.add(sequence);
-  state.speechQueue.push({ sequence, text, lang });
-  // Reading is slower than captions can arrive: drop the oldest queued lines
-  // rather than falling further and further behind the speaker.
-  while (state.speechQueue.length > MAX_SPEECH_BACKLOG) {
-    const dropped = state.speechQueue.shift();
-    state.spokenUpTo = Math.max(state.spokenUpTo, dropped.sequence);
-  }
-  processSpeechQueue();
+  speech().enqueue({ sequence, text, lang });
 }
 
 /** On-demand: read one specific line (click on a caption), regardless of the toggle. */
@@ -320,37 +351,7 @@ function speakLineNow(sequence) {
   const lang = languageInUse() || state.targetLanguages[0];
   const text = state.sourceLines.get(sequence)?.translations.get(lang);
   if (!text) return;
-  speechSynthesis.cancel();
-  state.speechQueue.length = 0;
-  state.queuedSeqs.clear();
-  state.speakingNow = null;
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = mapToVoiceLocale(lang);
-  const voice = pickVoice(u.lang);
-  if (voice) u.voice = voice;
-  speechSynthesis.speak(u);
-}
-
-function processSpeechQueue() {
-  if (!state.speechEnabled || state.speakingNow || !('speechSynthesis' in window)) return;
-  const next = state.speechQueue.shift();
-  if (!next) return;
-  state.speakingNow = next;
-
-  const u = new SpeechSynthesisUtterance(next.text);
-  u.lang = mapToVoiceLocale(next.lang);
-  const voice = pickVoice(u.lang);
-  if (voice) u.voice = voice;
-  const done = () => {
-    state.spokenUpTo = Math.max(state.spokenUpTo, next.sequence);
-    state.queuedSeqs.delete(next.sequence);
-    state.speakingNow = null;
-    processSpeechQueue();
-  };
-  u.onend = done;
-  u.onerror = done;
-  // Text subtitle already rendered — speech must not block it.
-  speechSynthesis.speak(u);
+  speech().speakNow({ sequence, text, lang });
 }
 
 function mapToVoiceLocale(base) {
@@ -372,10 +373,7 @@ function pickVoice(lang) {
 
 function stopSpeech() {
   if (!('speechSynthesis' in window)) return;
-  speechSynthesis.cancel();
-  state.speechQueue.length = 0;
-  state.queuedSeqs.clear();
-  state.speakingNow = null;
+  speech().stop();
 }
 
 // ------------------------------------------------------------------
@@ -389,7 +387,7 @@ function setStatus(text, cls) {
 }
 
 function hideControls() {
-  for (const id of ['language-select', 'speak-toggle', 'pause-speech', 'clear']) {
+  for (const id of ['language-select', 'speak-toggle', 'speech-rate', 'auto-catchup', 'pause-speech', 'clear']) {
     const n = el(id);
     if (n) n.disabled = true;
   }
@@ -413,6 +411,28 @@ document.addEventListener('DOMContentLoaded', () => {
     el('font-size').value = storedSize;
     document.documentElement.style.setProperty('--subtitle-size', `${storedSize}px`);
   }
+
+  // Reading speed + auto catch-up (remembered between visits).
+  const store = {
+    get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+    set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+  };
+  const showRate = () => { el('speech-rate-out').textContent = `${state.speechRate.toFixed(2).replace(/0$/, '')}×`; };
+  const storedRate = Number(store.get('speechRate'));
+  if (storedRate >= 0.5 && storedRate <= 2.5) state.speechRate = storedRate;
+  el('speech-rate').value = String(state.speechRate);
+  showRate();
+  el('speech-rate').addEventListener('input', (e) => {
+    state.speechRate = Number(e.target.value);
+    store.set('speechRate', String(state.speechRate));
+    showRate(); // applies from the next line that is read
+  });
+  state.autoCatchUp = store.get('autoCatchUp') !== 'false';
+  el('auto-catchup').checked = state.autoCatchUp;
+  el('auto-catchup').addEventListener('change', (e) => {
+    state.autoCatchUp = e.target.checked;
+    store.set('autoCatchUp', String(state.autoCatchUp));
+  });
 
   el('show-source').addEventListener('change', (e) => {
     el('source-captions-log').hidden = !e.target.checked;

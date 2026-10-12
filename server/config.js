@@ -57,7 +57,14 @@ export const config = {
     // Also use the LLM for live drafts (default: drafts use the fallback MT to save quota).
     drafts: (process.env.LLM_DRAFTS ?? 'false') === 'true',
     // How many earlier lines are sent as context with each final translation.
-    contextLines: Math.max(0, int(process.env.LLM_CONTEXT_LINES, 3)),
+    contextLines: Math.max(0, int(process.env.LLM_CONTEXT_LINES, 6)),
+    // ...but at most this many characters of context (oldest lines dropped first).
+    contextChars: Math.max(200, int(process.env.LLM_CONTEXT_CHARS, 1500)),
+    // Client-side request budget (free plans are often ~15 requests/minute).
+    // Requests beyond it go to the fallback instead of provoking HTTP 429.
+    maxRpm: Math.max(0, int(process.env.LLM_MAX_RPM, 15)),
+    // If the budget is full, wait up to this long for a free slot before falling back.
+    maxWaitMs: Math.max(0, int(process.env.LLM_MAX_WAIT_MS, 2500)),
   },
 
   transcription: {

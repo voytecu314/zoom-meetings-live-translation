@@ -12,6 +12,7 @@
 // `context` is only used by providers that can use it (llm).
 
 import { config } from '../config.js';
+import { createLogger } from '../log.js';
 import { createMockProvider } from './mock.js';
 import { createRateLimiter, TranslationError } from './provider-interface.js';
 
@@ -19,6 +20,8 @@ const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
 const TRANSIENT_FAILS_BEFORE_OPEN = 3;
 const TRANSIENT_COOLDOWN_MS = 60_000;
+
+const logger = createLogger('translation');
 
 let limiter = null;
 let forcedChain = null; // tests: { final: [...], draft: [...] }
@@ -91,8 +94,58 @@ function isOpen(name) {
   return !!h && h.openUntil > Date.now();
 }
 
+// ---- request budget for rate-limited (free) LLM plans -------------------
+const llmWindow = []; // timestamps of recent LLM requests
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** true = go ahead; false = over budget (caller falls back). May wait briefly for a slot. */
+async function acquireLlmSlot() {
+  const rpm = config.llm.maxRpm;
+  if (!rpm) return true;
+  const deadline = Date.now() + config.llm.maxWaitMs;
+  for (;;) {
+    const now = Date.now();
+    while (llmWindow.length && llmWindow[0] <= now - 60_000) llmWindow.shift();
+    if (llmWindow.length < rpm) {
+      llmWindow.push(now);
+      return true;
+    }
+    const wait = llmWindow[0] + 60_000 - now + 5;
+    if (now + wait > deadline) return false;
+    await sleep(wait);
+  }
+}
+
+// ---- stats + failover events -------------------------------------------
+let stats = newStats();
+let statsTimer = null;
+function newStats() {
+  return { ok: new Map(), fallbackLines: 0, errors: new Map(), overBudget: 0 };
+}
+const bump = (m, k) => m.set(k, (m.get(k) ?? 0) + 1);
+
+function ensureStatsTimer() {
+  if (statsTimer) return;
+  statsTimer = setInterval(flushStats, 60_000);
+  statsTimer.unref?.();
+}
+
+function flushStats() {
+  const parts = [];
+  for (const [name, n] of stats.ok) parts.push(`${name} ok ×${n}`);
+  if (stats.fallbackLines) parts.push(`${stats.fallbackLines} line(s) served by fallback`);
+  for (const [reason, n] of stats.errors) parts.push(`error "${reason}" ×${n}`);
+  if (stats.overBudget) parts.push(`over request budget ×${stats.overBudget} (${config.llm.maxRpm}/min)`);
+  if (parts.length) logger.info(`last 60s: ${parts.join(' | ')}`);
+  stats = newStats();
+}
+
+const reasonOf = (err) => String(err?.reason || err?.message || err).replace(/\s+/g, ' ').slice(0, 70);
+
+/** Returns true if this failure just opened the circuit. */
 function recordFailure(name, err) {
   const h = health.get(name) ?? { openUntil: 0, fails: 0 };
+  const wasOpen = h.openUntil > Date.now();
   h.fails += 1;
   if (err?.cooldownMs) {
     h.openUntil = Date.now() + err.cooldownMs; // quota / rate limit / auth: open immediately
@@ -100,9 +153,12 @@ function recordFailure(name, err) {
     h.openUntil = Date.now() + TRANSIENT_COOLDOWN_MS;
   }
   health.set(name, h);
+  return !wasOpen && h.openUntil > Date.now() ? h.openUntil - Date.now() : 0;
 }
 
 function recordSuccess(name) {
+  const h = health.get(name);
+  if (h && (h.fails > 0 || h.openUntil)) logger.info(`✓ ${name} is working again`);
   health.set(name, { openUntil: 0, fails: 0 });
 }
 
@@ -163,17 +219,34 @@ export async function translateText(text, sourceLanguage, targetLanguage, opts =
   const usable = entries.filter((e) => !isOpen(e.name));
   const chain = usable.length ? usable : entries.slice(-1);
 
+  ensureStatsTimer();
+  const primaryName = forcedChain ? entries[0].name : config.translation.provider;
   let lastErr = null;
-  for (const e of chain) {
+  for (let i = 0; i < chain.length; i++) {
+    const e = chain[i];
+    const next = chain[i + 1]?.name;
     try {
+      if (e.name === 'llm' && !(await acquireLlmSlot())) {
+        stats.overBudget += 1;
+        logger.debug(`llm request budget (${config.llm.maxRpm}/min) is full → ${next ?? 'no fallback'}`);
+        lastErr = new TranslationError('llm request budget exhausted and no fallback configured');
+        continue; // not a provider failure: no circuit-breaker bookkeeping
+      }
       const p = await e.get();
       const out = await limiter.run(() => runProvider(p, text, sourceLanguage, targetLanguage, opts));
       recordSuccess(e.name);
+      bump(stats.ok, e.name);
+      if (quality === 'final' && e.name !== primaryName) stats.fallbackLines += 1;
       return { ok: true, text: out, provider: e.name };
     } catch (err) {
       lastErr = err;
-      recordFailure(e.name, err);
-      console.warn(`[translation] ${e.name} failed (${quality}): ${err?.message ?? err}${chain.length > 1 ? ' — trying fallback' : ''}`);
+      const openedForMs = recordFailure(e.name, err);
+      bump(stats.errors, `${e.name}: ${reasonOf(err)}`);
+      logger.warn(`⚠ ${e.name} failed (${quality}): ${reasonOf(err)}` +
+        (next ? ` → falling back to ${next} for this line` : ' → no fallback left'));
+      if (openedForMs) {
+        logger.warn(`⚠ ${e.name} paused for ${Math.ceil(openedForMs / 1000)}s` + (next ? `; using ${next} meanwhile` : ''));
+      }
     }
   }
   return { ok: false, error: lastErr instanceof Error ? lastErr.message : String(lastErr) };
@@ -189,10 +262,12 @@ export function __setProviderForTests(p) {
 export function __setChainForTests(chains) {
   forcedChain = chains;
   health.clear();
+  llmWindow.length = 0;
   ensureLimiter();
 }
 
 /** Test helper: forget circuit-breaker state. */
 export function __resetHealthForTests() {
   health.clear();
+  llmWindow.length = 0;
 }

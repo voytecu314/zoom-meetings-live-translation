@@ -79,9 +79,19 @@ boundaries cannot be found in the text. Translation is therefore done per
    drafts stay on Google. On any LLM error or an exhausted quota the call falls
    back to `google-x`, and the LLM is skipped for a cooldown. A pause right
    after a dangling word ("and", "the"...) is held open (`DANGLING_HOLD_MS`).
+   Failovers are logged (`⚠ llm failed: rate limited (429) → falling back to
+   google-x`, `✓ llm is working again`) plus a per-minute summary line.
+   `LOG_LEVEL=debug` shows every text chunk and translated line.
 4. Only finals are read aloud and stored in the catch-up history.
 
 If the recognizer does emit sentence punctuation, it also ends utterances.
+
+### Reading aloud (viewer)
+
+Lines are read in order. If reading falls behind, it speeds up (**Auto
+catch-up**) instead of skipping; only a backlog of more than ~25 s drops the
+oldest lines, and those stay on screen dimmed (click one to hear it). The
+**Speed** slider sets the base reading speed and is remembered per browser.
 
 ## Testing without Zoom (mock mode)
 

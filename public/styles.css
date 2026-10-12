@@ -132,6 +132,17 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .subtitle.speakable:hover { background: rgba(127, 127, 127, 0.12); border-radius: 8px; }
 
 /* Source line shown while its translation is in flight. */
+.subtitle.speaking {
+  border-left: 4px solid var(--accent); /* line being read aloud */
+  padding-left: 0.6rem;
+}
+
+.subtitle.skipped {
+  opacity: 0.55; /* not read aloud (speech was too far behind); click to hear it */
+}
+
+.output-inline, #speech-rate-out { min-width: 2.6rem; color: var(--muted); font-size: 0.9rem; }
+
 .subtitle.draft {
   opacity: 0.7; /* live draft: will be replaced by the final translation */
 }
