@@ -161,6 +161,16 @@ httpServer.listen(config.env.port, () => {
   console.log(`  env:        ${config.env.nodeEnv}, provider=${config.translation.provider}` +
     (config.translation.fallback ? `, fallback=${config.translation.fallback}` : '') +
     (config.translation.provider === 'llm' ? `, model=${config.llm.model}` : ''));
+
+  // Tell the operator right away whether the LLM key/model/plan actually works.
+  if (config.translation.provider === 'llm') {
+    import('./translation/llm.js').then(async ({ checkLlm, explainCheck }) => {
+      const r = await checkLlm(config.llm);
+      const line = `LLM self-check: ${explainCheck(r)}`;
+      if (r.ok) console.log(`[translation] ${line}`);
+      else console.warn(`[translation] ⚠ ${line}\n[translation]   run "npm run check-llm" for details; captions fall back to ${config.translation.fallback || 'nothing'}`);
+    });
+  }
 });
 
 export { app, httpServer, ws };

@@ -62,6 +62,7 @@ export function createLlmProvider({
 }) {
   if (!apiKey) throw new TranslationError('LLM provider needs LLM_API_KEY');
   const url = `${String(baseUrl).replace(/\/+$/, '')}/chat/completions`;
+  let sendReasoning = !!reasoningEffort; // dropped automatically if the model rejects it
 
   return {
     name: 'llm',
@@ -75,17 +76,29 @@ export function createLlmProvider({
           { role: 'user', content: userPrompt(text, context, sourceLanguage, targetLanguage) },
         ],
       };
-      if (reasoningEffort) body.reasoning_effort = reasoningEffort; // no-op on non-reasoning models
+      const send = async () => {
+        if (sendReasoning) body.reasoning_effort = reasoningEffort;
+        else delete body.reasoning_effort;
+        try {
+          return await fetchWithTimeout(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify(body),
+          }, timeoutMs);
+        } catch (err) {
+          throw new TranslationError(`LLM request failed: ${err?.name === 'AbortError' ? 'timed out' : err?.message}`, { retryable: true, cause: err });
+        }
+      };
 
-      let res;
-      try {
-        res = await fetchWithTimeout(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(body),
-        }, timeoutMs);
-      } catch (err) {
-        throw new TranslationError(`LLM request failed: ${err?.name === 'AbortError' ? 'timed out' : err?.message}`, { retryable: true, cause: err });
+      let res = await send();
+      // Some models reject `reasoning_effort` with HTTP 400: drop it once and retry.
+      if (res.status === 400 && sendReasoning) {
+        let d = '';
+        try { d = (await res.clone().json())?.error?.message || ''; } catch {}
+        if (/reasoning|unknown|unsupported|unrecognized|not permitted|extra/i.test(d)) {
+          sendReasoning = false;
+          res = await send();
+        }
       }
 
       if (!res.ok) {
@@ -100,7 +113,7 @@ export function createLlmProvider({
           err.cooldownMs = /quota/i.test(detail)
             ? quotaCooldownMs
             : Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, quotaCooldownMs) : 15_000;
-          err.reason = /quota/i.test(detail) ? 'quota exhausted' : 'rate limited (429)';
+          err.reason = `${/quota/i.test(detail) ? 'quota exhausted' : 'rate limited (429)'}${detail ? `: ${detail.slice(0, 100)}` : ''}`;
         }
         else if (res.status === 401 || res.status === 402 || res.status === 403) err.cooldownMs = quotaCooldownMs;
         throw err; // 400 (e.g. content screen) → fall back for this text only
@@ -114,4 +127,72 @@ export function createLlmProvider({
       return out;
     },
   };
+}
+
+/**
+ * Diagnose the LLM setup: is the key valid, is the model listed, does one tiny
+ * request work, and what do the rate-limit headers say? Never throws.
+ * Used by `npm run check-llm` and by the startup self-check.
+ */
+export async function checkLlm({ baseUrl, apiKey, model, timeoutMs = 15000 }) {
+  const root = String(baseUrl).replace(/\/+$/, '');
+  const out = { ok: false, model, models: null, modelListed: null, status: null, ms: null, detail: '', headers: {} };
+  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+
+  try {
+    const r = await fetchWithTimeout(`${root}/models`, { headers }, timeoutMs);
+    if (r.ok) {
+      const j = await r.json();
+      out.models = (j?.data ?? []).map((m) => m.id).filter(Boolean);
+      out.modelListed = out.models.includes(model);
+    } else {
+      out.modelsStatus = r.status;
+    }
+  } catch (err) {
+    out.modelsError = err?.message;
+  }
+
+  const t0 = Date.now();
+  try {
+    const r = await fetchWithTimeout(`${root}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model,
+        temperature: 0,
+        messages: [{ role: 'user', content: 'Translate to German, output only the translation: Good morning' }],
+      }),
+    }, timeoutMs);
+    out.ms = Date.now() - t0;
+    out.status = r.status;
+    for (const [k, v] of r.headers) {
+      if (/^(retry-after|x-ratelimit|ratelimit|x-request-id)/i.test(k)) out.headers[k] = v;
+    }
+    const text = await r.text();
+    let j = null;
+    try { j = JSON.parse(text); } catch {}
+    if (r.ok) {
+      out.ok = true;
+      out.detail = String(j?.choices?.[0]?.message?.content ?? '').trim() || '(empty reply)';
+    } else {
+      out.detail = j?.error?.message || text.slice(0, 300);
+    }
+  } catch (err) {
+    out.ms = Date.now() - t0;
+    out.detail = err?.name === 'AbortError' ? 'timed out' : err?.message;
+  }
+  return out;
+}
+
+/** One-line human explanation of a checkLlm result. */
+export function explainCheck(r) {
+  if (r.ok) return `OK — model "${r.model}" replied in ${r.ms} ms: "${r.detail}"`;
+  const hint = {
+    401: 'the API key is wrong or missing',
+    402: 'this model needs credits — pick a model marked Free on your plan',
+    403: 'the key is not allowed to use this model',
+    404: 'unknown model id — compare with the list of model ids',
+    429: 'rate/quota limit hit — see detail and headers (is this model free on your plan?)',
+  }[r.status];
+  return `FAILED — HTTP ${r.status ?? 'n/a'}: ${r.detail}${hint ? `  (${hint})` : ''}`;
 }

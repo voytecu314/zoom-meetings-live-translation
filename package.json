@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "check-llm": "node scripts/check-llm.mjs"
   },
   "dependencies": {
     "express": "^4.21.2",

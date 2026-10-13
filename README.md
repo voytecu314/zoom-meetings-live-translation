@@ -86,6 +86,13 @@ boundaries cannot be found in the text. Translation is therefore done per
 
 If the recognizer does emit sentence punctuation, it also ends utterances.
 
+### Debugging the LLM provider
+
+`npm run check-llm` lists the models your key can see, sends one tiny test
+request with `LLM_MODEL` and prints the HTTP status, the API's error message and
+rate-limit headers. The server runs the same check at startup (`LLM self-check:`).
+The per-minute log line always shows `llm ok ×0` if the LLM never succeeded.
+
 ### Reading aloud (viewer)
 
 Lines are read in order. If reading falls behind, it speeds up (**Auto

@@ -13,7 +13,8 @@ try {
   for (const line of raw.split('\n')) {
     const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
     if (m && process.env[m[1]] === undefined) {
-      process.env[m[1]] = m[2];
+      // allow KEY="value" / KEY='value'
+      process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
     }
   }
 } catch {
@@ -49,7 +50,7 @@ export const config = {
   llm: {
     baseUrl: process.env.LLM_BASE_URL || 'https://router.bynara.id/v1',
     apiKey: process.env.LLM_API_KEY || '',
-    model: process.env.LLM_MODEL || 'deepseek-v4-flash',
+    model: process.env.LLM_MODEL || 'agnes-2.5-flash',
     timeoutMs: Math.max(1000, int(process.env.LLM_TIMEOUT_MS, 6000)),
     reasoningEffort: process.env.LLM_REASONING_EFFORT ?? 'none',
     // After a quota/auth error, skip the LLM for this long (it is retried afterwards).

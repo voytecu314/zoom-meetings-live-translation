@@ -132,6 +132,8 @@ function ensureStatsTimer() {
 
 function flushStats() {
   const parts = [];
+  // Make "the LLM never succeeded" impossible to miss.
+  if (config.translation.provider === 'llm' && !stats.ok.has('llm') && (stats.ok.size || stats.errors.size)) parts.push('llm ok ×0');
   for (const [name, n] of stats.ok) parts.push(`${name} ok ×${n}`);
   if (stats.fallbackLines) parts.push(`${stats.fallbackLines} line(s) served by fallback`);
   for (const [reason, n] of stats.errors) parts.push(`error "${reason}" ×${n}`);
@@ -140,7 +142,7 @@ function flushStats() {
   stats = newStats();
 }
 
-const reasonOf = (err) => String(err?.reason || err?.message || err).replace(/\s+/g, ' ').slice(0, 70);
+const reasonOf = (err) => String(err?.reason || err?.message || err).replace(/\s+/g, ' ').slice(0, 140);
 
 /** Returns true if this failure just opened the circuit. */
 function recordFailure(name, err) {

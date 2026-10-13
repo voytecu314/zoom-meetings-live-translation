@@ -17,6 +17,10 @@ before(async () => {
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
+      if (req.method === 'GET' && req.url.endsWith('/models')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ data: [{ id: 'test-model' }, { id: 'other-model' }] }));
+      }
       const body = JSON.parse(raw || '{}');
       requests.push({ auth: req.headers.authorization, body });
       const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
@@ -111,4 +115,46 @@ test('request budget: over-budget lines go to the fallback without calling the L
   } finally {
     Object.assign(config.llm, prev);
   }
+});
+
+test('429 detail from the API is kept in the failure reason (so logs show WHY)', async () => {
+  mode = 'rate';
+  await assert.rejects(llm().translate('hi', 'en', 'de'), (err) => {
+    assert.match(err.reason, /rate limited \(429\).*Rate limit exceeded/);
+    assert.ok(err.cooldownMs > 0);
+    return true;
+  });
+});
+
+test('checkLlm reports model list, status, detail and hints', async () => {
+  const { checkLlm, explainCheck } = await import('../server/translation/llm.js');
+  const ok = await checkLlm({ baseUrl, apiKey: 'k', model: 'test-model' });
+  assert.equal(ok.ok, true);
+  assert.match(explainCheck(ok), /^OK/);
+  mode = 'quota';
+  const bad = await checkLlm({ baseUrl, apiKey: 'k', model: 'test-model' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.status, 429);
+  assert.match(explainCheck(bad), /FAILED — HTTP 429.*quota/);
+});
+
+test('model that rejects reasoning_effort with 400: retried once without it', async () => {
+  const seen = [];
+  const s2 = http.createServer((req, res) => {
+    let raw = ''; req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      const b = JSON.parse(raw); seen.push('reasoning_effort' in b);
+      res.writeHead(b.reasoning_effort ? 400 : 200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(b.reasoning_effort
+        ? { error: { message: "Unknown parameter: 'reasoning_effort'" } }
+        : { choices: [{ message: { content: 'Hallo' } }] }));
+    });
+  });
+  await new Promise((r) => s2.listen(0, '127.0.0.1', r));
+  try {
+    const p = createLlmProvider({ baseUrl: `http://127.0.0.1:${s2.address().port}/v1`, apiKey: 'k', model: 'm' });
+    assert.equal(await p.translate('hello', 'en', 'de'), 'Hallo');
+    assert.equal(await p.translate('again', 'en', 'de'), 'Hallo');
+    assert.deepEqual(seen, [true, false, false], 'learned to stop sending it');
+  } finally { s2.closeAllConnections?.(); s2.close(); }
 });
